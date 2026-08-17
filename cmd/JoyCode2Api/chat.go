@@ -78,7 +78,7 @@ func streamChat(client *joycode.Client, body map[string]interface{}) error {
 }
 
 func init() {
-	chatCmd.Flags().StringVarP(&chatModel, "model", "m", "JoyAI-Code", "模型名称")
+	chatCmd.Flags().StringVarP(&chatModel, "model", "m", "JoyAI-Code-1.5", "模型名称")
 	chatCmd.Flags().BoolVarP(&chatStream, "stream", "s", false, "流式输出")
 	chatCmd.Flags().IntVar(&chatMaxTokens, "max-tokens", 64000, "最大输出 token 数")
 	rootCmd.AddCommand(chatCmd)

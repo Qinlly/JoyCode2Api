@@ -11,7 +11,7 @@ import (
 // TranslateRequest converts an OpenAI ChatRequest to JoyCode API body.
 func TranslateRequest(req *ChatRequest) map[string]interface{} {
 	body := map[string]interface{}{
-		"model":  req.Model,
+		"model":  joycode.UpstreamModelID(req.Model),
 		"stream": req.Stream,
 	}
 	if len(req.Messages) > 0 {

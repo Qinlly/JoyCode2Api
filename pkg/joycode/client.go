@@ -56,15 +56,50 @@ var colorEndpoints = map[string]colorEndpoint{
 }
 
 var Models = []string{
+	"JoyAI-Code-1.5",
 	"JoyAI-Code",
-	"Claude-Opus-4.7",
+	"MiniMax-M3",
 	"MiniMax-M2.7",
+	"Kimi-K3",
 	"Kimi-K2.6",
 	"Kimi-K2.5",
+	"GLM-5.3",
+	"GLM-5.2",
+	"GLM-5.2-jcloud",
 	"GLM-5.1",
 	"GLM-5",
+	"GLM-5-jcloud",
 	"GLM-4.7",
+	"DeepSeek-V4-Pro",
 	"Doubao-Seed-2.0-pro",
+	"GPT-5.6 Sol",
+	"Claude-Opus-4.8",
+	"Claude-Opus-4.7",
+	"Claude-Sonnet-4.6",
+	"Claude-Opus-4.6",
+	"JoyCode-Base-V3",
+}
+
+// modelIDAliases maps friendly labels (as returned by ListModels) to the actual
+// upstream model IDs. Upstream renamed the Claude family with an "-hq" suffix
+// while keeping the label unchanged; sending the label to chat/completions
+// returns HTTP 200 with error body {"code":"6002","message":"模型不存在！"}.
+var modelIDAliases = map[string]string{
+	"Claude-Opus-4.8":   "Claude-Opus-4.8-hq",
+	"Claude-Opus-4.7":   "Claude-Opus-4.7-hq",
+	"Claude-Sonnet-4.6": "Claude-Sonnet-4.6-hq",
+	"Claude-Opus-4.6":   "Claude-Opus-4.6-hq",
+	// "GPT-5.6 Sol" is the label; the real upstream ID is lowercase-hyphenated.
+	"GPT-5.6 Sol": "gpt-5.6-sol",
+}
+
+// UpstreamModelID translates a model label to the real upstream model ID.
+// Unknown models pass through unchanged.
+func UpstreamModelID(model string) string {
+	if id, ok := modelIDAliases[model]; ok {
+		return id
+	}
+	return model
 }
 
 type Client struct {
@@ -387,6 +422,15 @@ func (c *Client) Post(endpoint string, body map[string]interface{}) (map[string]
 	if err := json.Unmarshal(data, &result); err != nil {
 		slog.Error("unmarshal upstream response", "endpoint", endpoint, "error", err)
 		return nil, fmt.Errorf("invalid JSON response (parse error: %s): %s", err.Error(), truncate(string(data), 500))
+	}
+	// Some upstream errors come back as HTTP 200 with an {"error":{...}} body
+	// (e.g. 6002 "模型不存在"). Surface them as real errors so callers never
+	// mistake an error payload for a valid completion.
+	if errObj, ok := result["error"].(map[string]interface{}); ok {
+		code, _ := errObj["code"].(string)
+		msg, _ := errObj["message"].(string)
+		slog.Error("upstream error body with HTTP 200", "endpoint", endpoint, "code", code, "message", msg)
+		return nil, fmt.Errorf("上游错误 %s: %s", code, msg)
 	}
 	return result, nil
 }

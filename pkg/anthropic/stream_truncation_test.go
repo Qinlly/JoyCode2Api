@@ -138,3 +138,56 @@ func TestStream_ContentFilterSurfacesError(t *testing.T) {
 		t.Errorf("content_filter must not be disguised as end_turn, got:\n%s", out)
 	}
 }
+
+func TestStream_ReasoningContentAndLength(t *testing.T) {
+	sse := "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"先分析\"}}]}\n" +
+		"data: {\"choices\":[{\"delta\":{\"content\":\"回答\"}}]}\n" +
+		"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n"
+	out := runStream(t, bodyOf(sse))
+
+	checks := []string{
+		`"content_block":{"type":"thinking"}`,
+		`"type":"thinking_delta","thinking":"先分析"`,
+		`"type":"content_block_stop","index":0`,
+		`"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}`,
+		`"type":"text_delta","text":"回答"`,
+		`"stop_reason":"max_tokens"`,
+		`"type":"message_stop"`,
+	}
+	for _, want := range checks {
+		if !strings.Contains(out, want) {
+			t.Errorf("expected %s in stream, got:\n%s", want, out)
+		}
+	}
+	// Reasoning is a native thinking block that must precede the visible
+	// answer; no raw <thinking> tags may leak into the text.
+	if strings.Contains(out, "<thinking>") || strings.Contains(out, "</thinking>") {
+		t.Errorf("must not emit raw <thinking> tags, got:\n%s", out)
+	}
+	if strings.Index(out, "先分析") > strings.Index(out, "回答") {
+		t.Errorf("reasoning must precede answer, got:\n%s", out)
+	}
+}
+
+func TestStream_ReasoningContentBeforeToolUse(t *testing.T) {
+	sse := "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"调用工具\"}}]}\n" +
+		"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"search\",\"arguments\":\"{\\\"q\\\":\\\"test\\\"}\"}}]}}]}\n" +
+		"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n"
+	out := runStream(t, bodyOf(sse))
+
+	thinkingStop := `"type":"content_block_stop","index":0`
+	toolStart := `"type":"content_block_start","index":1,"content_block":{"type":"tool_use"`
+	if !strings.Contains(out, thinkingStop) || !strings.Contains(out, toolStart) {
+		t.Errorf("thinking block must close before tool block starts, got:\n%s", out)
+	}
+	// Reasoning is emitted as a native thinking block; no raw <thinking> tags.
+	if !strings.Contains(out, `"type":"thinking_delta","thinking":"调用工具"`) {
+		t.Errorf("expected thinking_delta with reasoning, got:\n%s", out)
+	}
+	if strings.Contains(out, "<thinking>") {
+		t.Errorf("must not emit raw <thinking> tags, got:\n%s", out)
+	}
+	if !strings.Contains(out, `"stop_reason":"tool_use"`) {
+		t.Errorf("expected tool_use stop reason, got:\n%s", out)
+	}
+}

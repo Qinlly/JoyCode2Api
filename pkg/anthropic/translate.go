@@ -17,7 +17,7 @@ func TranslateRequest(req *MessageRequest, accountDefault string, systemDefault 
 	messages := buildMessages(req)
 
 	body := map[string]interface{}{
-		"model":      model,
+		"model":      joycode.UpstreamModelID(model),
 		"messages":   messages,
 		"stream":     req.Stream,
 		"max_tokens": req.MaxTokens,
@@ -97,11 +97,14 @@ func IsNativeAnthropicModel(model string) bool {
 
 func resolveNativeAnthropicModel(model string, accountDefault string, systemDefault string) string {
 	resolved := resolveModel(model, accountDefault, systemDefault)
-	if resolved == "Claude-Opus-4.7" {
-		return resolved
+	// Claude models that have their own upstream model ID — pass through directly
+	// (mapped to the real upstream ID, e.g. "Claude-Opus-4.8" → "Claude-Opus-4.8-hq").
+	if resolved == "Claude-Opus-4.8" || resolved == "Claude-Opus-4.7" ||
+		resolved == "Claude-Sonnet-4.6" || resolved == "Claude-Opus-4.6" {
+		return joycode.UpstreamModelID(resolved)
 	}
 	if IsNativeAnthropicModel(resolved) {
-		return "Claude-Opus-4.7"
+		return "Claude-Opus-4.8-hq"
 	}
 	return resolved
 }
@@ -142,7 +145,34 @@ func TranslateResponse(jcResp map[string]interface{}, reqModel string) *MessageR
 	content := []ContentBlock{}
 	stopReason := "end_turn"
 
-	// Handle tool_calls from JoyCode response
+	// Map upstream finish_reason to Anthropic stop_reason
+	if fr, ok := choice["finish_reason"].(string); ok {
+		switch fr {
+		case "tool_calls":
+			stopReason = "tool_use"
+		case "length":
+			stopReason = "max_tokens"
+		case "stop":
+			stopReason = "end_turn"
+		case "content_filter":
+			stopReason = "end_turn"
+		}
+	}
+
+	// Reasoning models return their visible chain of thought separately from
+	// message.content. Emit it as a native Anthropic thinking content block so
+	// clients like Claude Code render it with their native thinking UI, then
+	// the visible answer as its own text block.
+	reasoning, _ := msg["reasoning_content"].(string)
+	text, _ := msg["content"].(string)
+	if reasoning != "" {
+		content = append(content, ContentBlock{Type: "thinking", Thinking: reasoning})
+	}
+	if text != "" {
+		content = append(content, ContentBlock{Type: "text", Text: text})
+	}
+
+	// Handle tool_calls from JoyCode response.
 	toolCalls, _ := msg["tool_calls"].([]interface{})
 	if len(toolCalls) > 0 {
 		stopReason = "tool_use"
@@ -167,9 +197,11 @@ func TranslateResponse(jcResp map[string]interface{}, reqModel string) *MessageR
 				Input: input,
 			})
 		}
-	} else {
-		text, _ := msg["content"].(string)
-		content = append(content, ContentBlock{Type: "text", Text: text})
+	}
+
+	// Anthropic responses must contain at least one content block.
+	if len(content) == 0 {
+		content = append(content, ContentBlock{Type: "text", Text: ""})
 	}
 
 	return &MessageResponse{
@@ -302,8 +334,8 @@ func convertAssistantBlocks(blocks []contentBlock) map[string]interface{} {
 	}
 
 	msg := map[string]interface{}{
-		"role":      "assistant",
-		"content":   strings.Join(textParts, "\n"),
+		"role":    "assistant",
+		"content": strings.Join(textParts, "\n"),
 	}
 	if len(toolCalls) > 0 {
 		msg["tool_calls"] = toolCalls
@@ -508,7 +540,7 @@ func convertToolChoice(raw json.RawMessage) interface{} {
 	case "tool":
 		if tc.Name != "" {
 			return map[string]interface{}{
-				"type": "function",
+				"type":     "function",
 				"function": map[string]string{"name": tc.Name},
 			}
 		}
@@ -527,8 +559,9 @@ func NewMessageID() string {
 type StreamChunk struct {
 	Choices []struct {
 		Delta struct {
-			Content   string `json:"content"`
-			ToolCalls []struct {
+			Content          string `json:"content"`
+			ReasoningContent string `json:"reasoning_content"`
+			ToolCalls        []struct {
 				ID       string `json:"id"`
 				Index    int    `json:"index"`
 				Type     string `json:"type"`

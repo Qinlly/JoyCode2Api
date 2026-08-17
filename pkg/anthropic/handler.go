@@ -75,14 +75,14 @@ func (h *Handler) handleMessages(w http.ResponseWriter, r *http.Request) {
 		req.MaxTokens = 32768
 	}
 
-		accountDefault := store.GetAccountDefaultModel(r)
-		systemDefault := ""
-		if h.store != nil {
-			systemDefault = h.store.GetSetting("default_model")
-		}
-		resolved := resolveModel(req.Model, accountDefault, systemDefault)
-		store.SetModel(r, resolved)
-		reqLog(r).Info("anthropic request", "model", req.Model, "resolved", resolved, "stream", req.Stream, "max_tokens", req.MaxTokens, "messages", len(req.Messages), "tools", len(req.Tools))
+	accountDefault := store.GetAccountDefaultModel(r)
+	systemDefault := ""
+	if h.store != nil {
+		systemDefault = h.store.GetSetting("default_model")
+	}
+	resolved := resolveModel(req.Model, accountDefault, systemDefault)
+	store.SetModel(r, resolved)
+	reqLog(r).Info("anthropic request", "model", req.Model, "resolved", resolved, "stream", req.Stream, "max_tokens", req.MaxTokens, "messages", len(req.Messages), "tools", len(req.Tools))
 
 	client := h.getClient(r)
 
@@ -155,13 +155,33 @@ func (h *Handler) handleNonStream(w http.ResponseWriter, r *http.Request, req *M
 		}
 		if strings.Contains(errMsg, "content_filter") || strings.Contains(errMsg, "SENSITIVE_CONTENT") {
 			reqLog(r).Warn("upstream content_filter (non-stream), returning detailed error")
-				writeContentFilterError(w, errMsg)
+			writeContentFilterError(w, errMsg)
 			return
 		}
 		writeAnthropicError(w, 500, errMsg)
 		return
 	}
 	resp := TranslateResponse(jcResp, req.Model)
+	blockTypes := make([]string, 0, len(resp.Content))
+	textBlocks, thinkingBlocks, toolBlocks := 0, 0, 0
+	for _, block := range resp.Content {
+		blockTypes = append(blockTypes, block.Type)
+		switch block.Type {
+		case "text":
+			textBlocks++
+		case "thinking":
+			thinkingBlocks++
+		case "tool_use":
+			toolBlocks++
+		}
+	}
+	reqLog(r).Info("translated anthropic response (non-stream)",
+		"block_types", blockTypes,
+		"text_blocks", textBlocks,
+		"thinking_blocks", thinkingBlocks,
+		"tool_blocks", toolBlocks,
+		"stop_reason", resp.StopReason,
+	)
 	// Check for content_filter in non-stream response
 	if choices, ok := jcResp["choices"].([]interface{}); ok && len(choices) > 0 {
 		if choice, ok := choices[0].(map[string]interface{}); ok {
@@ -305,6 +325,16 @@ func (h *Handler) handleStream(w http.ResponseWriter, r *http.Request, req *Mess
 			return
 		}
 		reqLog(r).Error("stream failed after retries", "error", errMsg)
+		// The stream connection failed in a generic way. The most common cause
+		// for reasoning models like Claude-Opus is that the upstream returns
+		// HTTP 200 then an immediate EOF ("read first line: EOF") — i.e. it
+		// doesn't actually support streaming for this model, even though the
+		// non-stream endpoint works. Fall back to a non-stream request and
+		// replay the result as SSE, so the client gets a complete answer
+		// instead of a truncated stream that crashes it.
+		if h.streamFallbackToNonStream(w, r, flusher, req, client, systemDefault) {
+			return
+		}
 		writeStreamError(w, flusher, errMsg)
 		return
 	}
@@ -318,6 +348,8 @@ func (h *Handler) handleStream(w http.ResponseWriter, r *http.Request, req *Mess
 	toolCalls := make(map[int]*toolCallAccum)
 	currentBlockIndex := 0
 	textBlockStarted := false
+	thinkingBlockOpen := false
+	thinkingBlockIndex := 0
 	toolBlockStarted := map[int]bool{}
 	toolBlockToIdx := map[int]int{}
 
@@ -343,6 +375,35 @@ func (h *Handler) handleStream(w http.ResponseWriter, r *http.Request, req *Mess
 			streamInTk = chunk.Usage.PromptTokens
 			streamOutTk = chunk.Usage.CompletionTokens
 		}
+		// DIAGNOSTIC: what did the parser extract from this delta?
+		if chunkCount <= 5 {
+			fr := ""
+			if choice.FinishReason != nil {
+				fr = *choice.FinishReason
+			}
+			reqLog(r).Info("DIAG parsed delta",
+				"n", chunkCount,
+				"content_len", len(choice.Delta.Content),
+				"reasoning_len", len(choice.Delta.ReasoningContent),
+				"tool_calls", len(choice.Delta.ToolCalls),
+				"finish_reason", fr,
+			)
+		}
+
+		// DIAGNOSTIC: what did the parser extract from this delta?
+		if chunkCount <= 5 {
+			fr := ""
+			if choice.FinishReason != nil {
+				fr = *choice.FinishReason
+			}
+			reqLog(r).Info("DIAG parsed delta",
+				"n", chunkCount,
+				"content_len", len(choice.Delta.Content),
+				"reasoning_len", len(choice.Delta.ReasoningContent),
+				"tool_calls", len(choice.Delta.ToolCalls),
+				"finish_reason", fr,
+			)
+		}
 
 		for _, tc := range choice.Delta.ToolCalls {
 			idx := tc.Index
@@ -361,6 +422,16 @@ func (h *Handler) handleStream(w http.ResponseWriter, r *http.Request, req *Mess
 			toolCalls[idx].Arguments += tc.Function.Arguments
 
 			if !toolBlockStarted[idx] {
+				// If a thinking block is still open (reasoning followed
+				// directly by a tool call with no visible text), close it
+				// before starting the tool block.
+				if thinkingBlockOpen {
+					thinkingBlockOpen = false
+					FormatSSE(w, "content_block_stop", sseContentBlockStop{
+						Type: "content_block_stop", Index: thinkingBlockIndex,
+					})
+					flusher.Flush()
+				}
 				if textBlockStarted {
 					FormatSSE(w, "content_block_stop", sseContentBlockStop{
 						Type: "content_block_stop", Index: currentBlockIndex,
@@ -389,14 +460,57 @@ func (h *Handler) handleStream(w http.ResponseWriter, r *http.Request, req *Mess
 			}
 		}
 
+		// Reasoning is emitted as a native Anthropic thinking content block
+		// (content_block_start type=thinking + thinking_delta) so clients like
+		// Claude Code render it with their native collapsible thinking UI
+		// instead of printing raw <thinking> tags in the visible text.
+		reasoning := choice.Delta.ReasoningContent
+		if reasoning != "" {
+			if !thinkingBlockOpen {
+				if textBlockStarted {
+					// Rare: reasoning resumed after visible text; close the
+					// text block so the thinking block is well-formed.
+					FormatSSE(w, "content_block_stop", sseContentBlockStop{
+						Type: "content_block_stop", Index: currentBlockIndex,
+					})
+					currentBlockIndex++
+					textBlockStarted = false
+				}
+				thinkingBlockOpen = true
+				thinkingBlockIndex = currentBlockIndex
+				FormatSSE(w, "content_block_start", sseContentBlockStart{
+					Type:         "content_block_start",
+					Index:        currentBlockIndex,
+					ContentBlock: ContentBlock{Type: "thinking", Thinking: ""},
+				})
+				currentBlockIndex++
+				flusher.Flush()
+			}
+			totalOutput += len(reasoning)
+			FormatSSE(w, "content_block_delta", sseContentBlockDelta{
+				Type:  "content_block_delta",
+				Index: thinkingBlockIndex,
+				Delta: deltaText{Type: "thinking_delta", Thinking: reasoning},
+			})
+			flusher.Flush()
+		}
+
 		text := choice.Delta.Content
-		if text != "" {
+		if text !="" {
 			if !textBlockStarted {
 				textBlockStarted = true
 				FormatSSE(w, "content_block_start", sseContentBlockStart{
 					Type:         "content_block_start",
 					Index:        currentBlockIndex,
 					ContentBlock: ContentBlock{Type: "text", Text: ""},
+				})
+				flusher.Flush()
+			}
+			// Close the thinking block before the first real text output
+			if thinkingBlockOpen {
+				thinkingBlockOpen = false
+				FormatSSE(w, "content_block_stop", sseContentBlockStop{
+					Type: "content_block_stop", Index: thinkingBlockIndex,
 				})
 				flusher.Flush()
 			}
@@ -414,8 +528,19 @@ func (h *Handler) handleStream(w http.ResponseWriter, r *http.Request, req *Mess
 			finishReasonSeen = true
 			reqLog(r).Info("stream completed", "chunks", chunkCount, "reason", fr, "tools", len(toolCalls))
 
+			// Close a still-open thinking block at stream end (reasoning with
+			// no following visible text). Its index was already consumed when
+			// opened, so no currentBlockIndex bookkeeping is needed here.
+			if thinkingBlockOpen {
+				thinkingBlockOpen = false
+				FormatSSE(w, "content_block_stop", sseContentBlockStop{
+					Type: "content_block_stop", Index: thinkingBlockIndex,
+				})
+				flusher.Flush()
+			}
+
 			// Ensure at least one content block exists — Anthropic SDK requires it
-			if !textBlockStarted && len(toolBlockStarted) == 0 {
+			if !textBlockStarted && len(toolBlockStarted) == 0 && currentBlockIndex == 0 {
 				textBlockStarted = true
 				FormatSSE(w, "content_block_start", sseContentBlockStart{
 					Type:         "content_block_start",
@@ -485,6 +610,15 @@ func (h *Handler) handleStream(w http.ResponseWriter, r *http.Request, req *Mess
 	// is true the loop already emitted message_stop, so a trailing read error after
 	// a complete answer is ignored.
 	if !finishReasonSeen {
+		// Close a still-open thinking block so the client receives a
+		// well-formed block boundary on a truncated stream.
+		if thinkingBlockOpen {
+			thinkingBlockOpen = false
+			FormatSSE(w, "content_block_stop", sseContentBlockStop{
+				Type: "content_block_stop", Index: thinkingBlockIndex,
+			})
+			flusher.Flush()
+		}
 		if textBlockStarted {
 			FormatSSE(w, "content_block_stop", sseContentBlockStop{
 				Type: "content_block_stop", Index: currentBlockIndex,
@@ -1009,6 +1143,162 @@ func writeAnthropicJSON(w http.ResponseWriter, code int, v interface{}) {
 	w.Header().Set("Access-Control-Allow-Origin", "*")
 	w.WriteHeader(code)
 	w.Write(b)
+}
+
+// streamFallbackToNonStream is invoked when the upstream stream connection fails
+// in a way that suggests the upstream simply doesn't support streaming for this
+// model (e.g. it returns HTTP 200 then an immediate EOF, producing repeated
+// "read first line: EOF" errors). Since message_start has already been emitted
+// to the client, we cannot cleanly abort — the client expects a well-formed
+// message with at least one content block followed by message_stop, otherwise
+// it crashes (e.g. `o.text.trim()` on undefined).
+//
+// This function performs a *non-streaming* request to the same upstream endpoint
+// (which is known to work for these models) and replays the complete response as
+// a sequence of SSE events: content_block_start/delta/stop for each block, then
+// message_delta + message_stop. Returns true if the fallback produced a complete
+// response, false if it also failed (caller should then surface an error).
+func (h *Handler) streamFallbackToNonStream(w http.ResponseWriter, r *http.Request, flusher http.Flusher, req *MessageRequest, client *joycode.Client, systemDefault string) bool {
+	reqLog(r).Warn("stream upstream unusable, falling back to non-stream and replaying as SSE")
+
+	jcBody := TranslateRequest(req, store.GetAccountDefaultModel(r), systemDefault)
+	// Ensure non-stream mode for the fallback request.
+	delete(jcBody, "stream")
+
+	maxRetries := 3
+	if h.store != nil {
+		maxRetries = h.store.GetIntSetting("max_retries", 3)
+	}
+	var jcResp map[string]interface{}
+	var lastErr error
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		jcResp, lastErr = client.Post(chatEndpoint, jcBody)
+		if lastErr == nil {
+			break
+		}
+		reqLog(r).Error("stream fallback non-stream error", "attempt", attempt, "max", maxRetries, "error", lastErr)
+		if attempt < maxRetries {
+			time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
+		}
+	}
+	if lastErr != nil {
+		reqLog(r).Error("stream fallback failed", "error", lastErr)
+		return false
+	}
+
+	resp := TranslateResponse(jcResp, req.Model)
+
+	// Defensive: never replay an upstream error payload as an empty message.
+	// (Post now rejects HTTP 200 + {"error":...} bodies, this is a backstop.)
+	if errObj, ok := jcResp["error"]; ok {
+		reqLog(r).Error("stream fallback got upstream error body", "error", fmt.Sprint(errObj))
+		return false
+	}
+
+	// Replay each content block as SSE. message_start was already emitted by
+	// the caller, so we start from content_block_start.
+	blockIndex := 0
+	outputChars := 0
+	for _, block := range resp.Content {
+		switch block.Type {
+		case "thinking":
+			FormatSSE(w, "content_block_start", sseContentBlockStart{
+				Type:         "content_block_start",
+				Index:        blockIndex,
+				ContentBlock: ContentBlock{Type: "thinking", Thinking: ""},
+			})
+			FormatSSE(w, "content_block_delta", sseContentBlockDelta{
+				Type:  "content_block_delta",
+				Index: blockIndex,
+				Delta: deltaText{Type: "thinking_delta", Thinking: block.Thinking},
+			})
+			FormatSSE(w, "content_block_stop", sseContentBlockStop{
+				Type: "content_block_stop", Index: blockIndex,
+			})
+			outputChars += len(block.Thinking)
+		case "text":
+			text := block.Text
+			FormatSSE(w, "content_block_start", sseContentBlockStart{
+				Type:         "content_block_start",
+				Index:        blockIndex,
+				ContentBlock: ContentBlock{Type: "text", Text: ""},
+			})
+			FormatSSE(w, "content_block_delta", sseContentBlockDelta{
+				Type:  "content_block_delta",
+				Index: blockIndex,
+				Delta: deltaText{Type: "text_delta", Text: text},
+			})
+			FormatSSE(w, "content_block_stop", sseContentBlockStop{
+				Type: "content_block_stop", Index: blockIndex,
+			})
+			outputChars += len(text)
+		case "tool_use":
+			args := "{}"
+			if raw, err := json.Marshal(block.Input); err == nil && json.Valid(raw) {
+				args = string(raw)
+			}
+			FormatSSE(w, "content_block_start", sseContentBlockStart{
+				Type:  "content_block_start",
+				Index: blockIndex,
+				ContentBlock: ContentBlock{
+					Type: "tool_use", ID: block.ID, Name: block.Name,
+					Input: json.RawMessage("{}"),
+				},
+			})
+			FormatSSE(w, "content_block_delta", sseContentBlockDelta{
+				Type:  "content_block_delta",
+				Index: blockIndex,
+				Delta: deltaText{Type: "input_json_delta", PartialJSON: args},
+			})
+			FormatSSE(w, "content_block_stop", sseContentBlockStop{
+				Type: "content_block_stop", Index: blockIndex,
+			})
+		default:
+			blockIndex--
+		}
+		blockIndex++
+		flusher.Flush()
+	}
+
+	// Guarantee at least one content block so the client never sees an empty
+	// message (which triggers the o.text.trim() crash).
+	if blockIndex == 0 {
+		FormatSSE(w, "content_block_start", sseContentBlockStart{
+			Type:         "content_block_start",
+			Index:        0,
+			ContentBlock: ContentBlock{Type: "text", Text: ""},
+		})
+		FormatSSE(w, "content_block_stop", sseContentBlockStop{
+			Type: "content_block_stop", Index: 0,
+		})
+		flusher.Flush()
+	}
+
+	stopReason := "end_turn"
+	if resp.StopReason != nil && *resp.StopReason != "" {
+		stopReason = *resp.StopReason
+	}
+	outTokens := resp.Usage.OutputTokens
+	if outTokens == 0 {
+		outTokens = outputChars / 4
+	}
+	FormatSSE(w, "message_delta", sseMessageDelta{
+		Type:  "message_delta",
+		Delta: deltaStop{StopReason: stopReason},
+		Usage: struct {
+			OutputTokens int `json:"output_tokens"`
+		}{OutputTokens: outTokens},
+	})
+	FormatSSE(w, "message_stop", sseMessageStop{Type: "message_stop"})
+	flusher.Flush()
+
+	if usage, ok := jcResp["usage"].(map[string]interface{}); ok {
+		inTk, _ := usage["prompt_tokens"].(float64)
+		outTk, _ := usage["completion_tokens"].(float64)
+		store.SetTokenUsage(r, int(inTk), int(outTk))
+	}
+	reqLog(r).Info("stream fallback replayed as SSE", "blocks", blockIndex, "stop_reason", stopReason)
+	return true
 }
 
 // writeStreamError emits an Anthropic `error` SSE event mid-stream. Used when an

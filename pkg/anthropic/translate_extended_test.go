@@ -280,6 +280,66 @@ func TestTranslateResponse_NormalText(t *testing.T) {
 	}
 }
 
+func TestTranslateResponse_ReasoningContentAndLength(t *testing.T) {
+	jcResp := map[string]interface{}{
+		"choices": []interface{}{
+			map[string]interface{}{
+				"finish_reason": "length",
+				"message": map[string]interface{}{
+					"reasoning_content": "先分析问题",
+					"content":           "最终回答",
+				},
+			},
+		},
+	}
+
+	resp := TranslateResponse(jcResp, "JoyAI-Code-1.5")
+	if resp.StopReason == nil || *resp.StopReason != "max_tokens" {
+		t.Fatalf("StopReason = %v, want max_tokens", resp.StopReason)
+	}
+	if len(resp.Content) != 2 {
+		t.Fatalf("len(Content) = %d, want 2", len(resp.Content))
+	}
+	if resp.Content[0].Type != "thinking" || resp.Content[0].Thinking != "先分析问题" {
+		t.Errorf("Content[0] = %+v, want thinking block with reasoning", resp.Content[0])
+	}
+	if resp.Content[1].Type != "text" || resp.Content[1].Text != "最终回答" {
+		t.Errorf("Content[1] = %+v, want text block with answer", resp.Content[1])
+	}
+}
+
+func TestTranslateResponse_ReasoningContentWithToolUse(t *testing.T) {
+	jcResp := map[string]interface{}{
+		"choices": []interface{}{
+			map[string]interface{}{
+				"message": map[string]interface{}{
+					"reasoning_content": "需要调用工具",
+					"tool_calls": []interface{}{
+						map[string]interface{}{
+							"id": "call_1",
+							"function": map[string]interface{}{
+								"name":      "search",
+								"arguments": `{"q":"test"}`,
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	resp := TranslateResponse(jcResp, "JoyAI-Code-1.5")
+	if len(resp.Content) != 2 {
+		t.Fatalf("len(Content) = %d, want 2", len(resp.Content))
+	}
+	if resp.Content[0].Type != "thinking" || resp.Content[0].Thinking != "需要调用工具" {
+		t.Errorf("Content[0] = %+v, want thinking block with reasoning", resp.Content[0])
+	}
+	if resp.Content[1].Type != "tool_use" {
+		t.Errorf("Content[1] = %+v, want tool_use", resp.Content[1])
+	}
+}
+
 func TestTranslateResponse_ToolUse(t *testing.T) {
 	// Case 14: Tool use response with stop_reason="tool_use".
 	jcResp := map[string]interface{}{

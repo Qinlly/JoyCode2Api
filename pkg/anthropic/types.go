@@ -55,11 +55,40 @@ type MessageResponse struct {
 
 // ContentBlock is a single content block in the response.
 type ContentBlock struct {
-	Type  string `json:"type"`
-	Text  string `json:"text"`
-	ID    string `json:"id,omitempty"`
-	Name  string `json:"name,omitempty"`
-	Input any    `json:"input,omitempty"`
+	Type     string `json:"type"`
+	Text     string `json:"text,omitempty"`
+	Thinking string `json:"thinking,omitempty"`
+	ID       string `json:"id,omitempty"`
+	Name     string `json:"name,omitempty"`
+	Input    any    `json:"input,omitempty"`
+}
+
+// MarshalJSON ensures that text blocks always carry a "text" field, even when
+// empty. Anthropic's SSE contract requires content_block_start for a text
+// block to include "text":"", and some clients call block.text.trim() on every
+// block — an omitted text field yields `undefined` and crashes them. For
+// non-text blocks we keep the default omitempty behavior so tool_use/thinking
+// blocks don't gain a spurious empty text field.
+func (c ContentBlock) MarshalJSON() ([]byte, error) {
+	type alias ContentBlock // avoid recursion
+	if c.Type == "text" {
+		return json.Marshal(struct {
+			Type     string `json:"type"`
+			Text     string `json:"text"`
+			Thinking string `json:"thinking,omitempty"`
+			ID       string `json:"id,omitempty"`
+			Name     string `json:"name,omitempty"`
+			Input    any    `json:"input,omitempty"`
+		}{
+			Type:     c.Type,
+			Text:     c.Text,
+			Thinking: c.Thinking,
+			ID:       c.ID,
+			Name:     c.Name,
+			Input:    c.Input,
+		})
+	}
+	return json.Marshal(alias(c))
 }
 
 // Usage reports token consumption.
@@ -91,6 +120,7 @@ type deltaText struct {
 	Type         string `json:"type"`
 	Text         string `json:"text,omitempty"`
 	PartialJSON  string `json:"partial_json,omitempty"`
+	Thinking     string `json:"thinking,omitempty"`
 }
 
 type sseContentBlockStop struct {
