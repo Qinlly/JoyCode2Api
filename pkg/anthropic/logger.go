@@ -33,15 +33,36 @@ func reqLog(r *http.Request) *slog.Logger {
 // Logs message count, tool count, system prompt length, and first few message roles.
 func logRequestDetails(r *http.Request, label string, body map[string]interface{}) {
 	log := reqLog(r)
+	// The translated body comes from json round-trips (TranslateRequest /
+	// TranslateAnthropicRequest), so collections are []interface{} and numbers
+	// are float64. The old []map[string]interface{} assertion never matched,
+	// which made these log lines report messages=0 tools=0 (misleading during
+	// incident diagnosis). Handle every shape we can produce.
 	msgCount := 0
-	if msgs, ok := body["messages"].([]map[string]interface{}); ok {
+	switch msgs := body["messages"].(type) {
+	case []interface{}:
+		msgCount = len(msgs)
+	case []map[string]interface{}:
 		msgCount = len(msgs)
 	}
 	toolCount := 0
-	if tools, ok := body["tools"].([]interface{}); ok {
+	switch tools := body["tools"].(type) {
+	case []interface{}:
+		toolCount = len(tools)
+	case []map[string]interface{}:
 		toolCount = len(tools)
 	}
-	maxTokens, _ := body["max_tokens"].(int)
+	maxTokens := 0
+	switch v := body["max_tokens"].(type) {
+	case int:
+		maxTokens = v
+	case float64:
+		maxTokens = int(v)
+	case json.Number:
+		if n, err := v.Int64(); err == nil {
+			maxTokens = int(n)
+		}
+	}
 	model, _ := body["model"].(string)
 	stream, _ := body["stream"].(bool)
 

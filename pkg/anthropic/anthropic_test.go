@@ -2,6 +2,7 @@ package anthropic
 
 import (
 	"encoding/json"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -191,6 +192,77 @@ func TestHandlerMessagesEndpoint(t *testing.T) {
 				t.Errorf("status = %d, want %d; body = %s", w.Code, tt.wantStatus, w.Body.String())
 			}
 		})
+	}
+}
+
+func TestCountTokensEndpoint(t *testing.T) {
+	tests := []struct {
+		name       string
+		method     string
+		body       string
+		wantStatus int
+	}{
+		{"OPTIONS preflight", "OPTIONS", "", 200},
+		{"GET rejected", "GET", "", 405},
+		{"invalid JSON", "POST", `{bad}`, 400},
+		{"valid request", "POST", `{"model":"claude-sonnet-4","messages":[{"role":"user","content":"hello"}]}`, 200},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var body strings.Reader
+			if tt.body != "" {
+				body = *strings.NewReader(tt.body)
+			}
+			req := httptest.NewRequest(tt.method, "/v1/messages/count_tokens", &body)
+			if tt.method == "POST" {
+				req.Header.Set("Content-Type", "application/json")
+			}
+			w := httptest.NewRecorder()
+			h := &Handler{}
+			h.handleCountTokens(w, req)
+			if w.Code != tt.wantStatus {
+				t.Errorf("status = %d, want %d; body = %s", w.Code, tt.wantStatus, w.Body.String())
+			}
+			// Only POST responses carry a JSON body; OPTIONS preflight is empty.
+			if tt.wantStatus == 200 && tt.method == "POST" {
+				var resp struct {
+					InputTokens int `json:"input_tokens"`
+				}
+				if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+					t.Fatalf("response is not valid JSON with input_tokens: %v; body = %s", err, w.Body.String())
+				}
+				if resp.InputTokens <= 0 {
+					t.Errorf("input_tokens = %d, want > 0", resp.InputTokens)
+				}
+			}
+		})
+	}
+}
+
+func TestCountTokensRouteRegistered(t *testing.T) {
+	mux := http.NewServeMux()
+	h := &Handler{}
+	h.RegisterRoutes(mux)
+
+	req := httptest.NewRequest("POST", "/v1/messages/count_tokens",
+		strings.NewReader(`{"model":"claude-sonnet-4","messages":[{"role":"user","content":"hello world, this is a test"}]}`))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("status = %d, want 200; body = %s", w.Code, w.Body.String())
+	}
+	if ct := w.Header().Get("Content-Type"); !strings.Contains(ct, "application/json") {
+		t.Errorf("Content-Type = %q, want application/json", ct)
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("invalid JSON: %v; body = %s", err, w.Body.String())
+	}
+	if _, ok := resp["input_tokens"]; !ok {
+		t.Errorf("missing input_tokens in response: %s", w.Body.String())
 	}
 }
 

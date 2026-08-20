@@ -43,6 +43,7 @@ func (h *Handler) getClient(r *http.Request) *joycode.Client {
 // RegisterRoutes registers the Anthropic Messages API endpoint.
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/messages", h.handleMessages)
+	mux.HandleFunc("/v1/messages/count_tokens", h.handleCountTokens)
 }
 
 func (h *Handler) handleMessages(w http.ResponseWriter, r *http.Request) {
@@ -647,6 +648,15 @@ func (h *Handler) handleStream(w http.ResponseWriter, r *http.Request, req *Mess
 }
 
 func (h *Handler) handleNativeAnthropicStream(w http.ResponseWriter, r *http.Request, req *MessageRequest, client *joycode.Client, flusher http.Flusher, systemDefault string) {
+	// Preemptive truncation: this path previously bypassed PreemptiveTruncate
+	// (only the OpenAI translation path used it), letting sessions grow until
+	// the upstream started dropping oversized connections with bare EOFs.
+	if rounds := PreemptiveTruncate(req); rounds < 0 {
+		writeAnthropicRequestError(w, "上下文过长，自动截断后仍超出限制，请使用 /compact 或开启新对话。")
+		return
+	} else if rounds > 0 {
+		reqLog(r).Warn("preemptive truncation applied (native anthropic stream)", "rounds", rounds)
+	}
 	body := TranslateAnthropicRequest(req, store.GetAccountDefaultModel(r), systemDefault)
 	logRequestDetails(r, "translated native anthropic request (stream)", body)
 
@@ -679,6 +689,18 @@ func (h *Handler) handleNativeAnthropicStream(w http.ResponseWriter, r *http.Req
 	}()
 
 	resp, err := h.connectNativeAnthropicStreamWithRetry(r, body, client)
+	// The upstream sometimes refuses an oversized request by closing the
+	// connection without any error body (bare EOF). If the context is large
+	// enough for size to be the plausible cause, auto-truncate and retry
+	// before giving up.
+	for err != nil && isOversizeDropError(err) {
+		if !maybeTruncateForRetry(req) {
+			break
+		}
+		reqLog(r).Warn("native anthropic stream: upstream dropped connection, retrying with truncated context", "messages", len(req.Messages))
+		body = TranslateAnthropicRequest(req, store.GetAccountDefaultModel(r), systemDefault)
+		resp, err = h.connectNativeAnthropicStreamWithRetry(r, body, client)
+	}
 	close(stopHeartbeat)
 	<-heartbeatDone
 	if err != nil {
@@ -752,10 +774,26 @@ func (h *Handler) handleNativeAnthropicStream(w http.ResponseWriter, r *http.Req
 }
 
 func (h *Handler) handleNativeAnthropicNonStream(w http.ResponseWriter, r *http.Request, req *MessageRequest, client *joycode.Client, systemDefault string) {
+	// Preemptive truncation, same rationale as the stream path above.
+	if rounds := PreemptiveTruncate(req); rounds < 0 {
+		writeAnthropicRequestError(w, "上下文过长，自动截断后仍超出限制，请使用 /compact 或开启新对话。")
+		return
+	} else if rounds > 0 {
+		reqLog(r).Warn("preemptive truncation applied (native anthropic non-stream)", "rounds", rounds)
+	}
 	body := TranslateAnthropicRequest(req, store.GetAccountDefaultModel(r), systemDefault)
 	logRequestDetails(r, "translated native anthropic request (non-stream)", body)
 
 	resp, err := h.connectNativeAnthropicStreamWithRetry(r, body, client)
+	// Oversized-request drop: auto-truncate and retry before surfacing a 500.
+	for err != nil && isOversizeDropError(err) {
+		if !maybeTruncateForRetry(req) {
+			break
+		}
+		reqLog(r).Warn("native anthropic non-stream: upstream dropped connection, retrying with truncated context", "messages", len(req.Messages))
+		body = TranslateAnthropicRequest(req, store.GetAccountDefaultModel(r), systemDefault)
+		resp, err = h.connectNativeAnthropicStreamWithRetry(r, body, client)
+	}
 	if err != nil {
 		reqLog(r).Error("native anthropic non-stream failed after retries", "error", err)
 		writeAnthropicError(w, 500, err.Error())
@@ -872,6 +910,28 @@ func (h *Handler) handleNativeAnthropicNonStream(w http.ResponseWriter, r *http.
 			OutputTokens: outTk,
 		},
 	})
+}
+
+// isOversizeDropError reports whether an upstream error looks like a dropped
+// connection (no error body, immediate EOF / reset) — the failure mode the
+// gateway uses for requests it refuses, e.g. because of payload size.
+func isOversizeDropError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "EOF") || strings.Contains(msg, "connection reset")
+}
+
+// maybeTruncateForRetry truncates the request context when it is large enough
+// that size is the plausible cause of an upstream connection drop. Small
+// contexts are left alone — their EOF failures are transient upstream issues,
+// and truncating would destroy context for no benefit.
+func maybeTruncateForRetry(req *MessageRequest) bool {
+	if estimateTokens(req) < contextWindowSize/2 {
+		return false
+	}
+	return truncateMessages(req)
 }
 
 func (h *Handler) connectNativeAnthropicStreamWithRetry(r *http.Request, body map[string]interface{}, client *joycode.Client) (*http.Response, error) {
