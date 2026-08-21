@@ -6,14 +6,25 @@ import (
 )
 
 const (
-	// Upstream model context window size (JoyCode's ModelArts limit)
-	contextWindowSize = 196608
-	// Safety margin: start truncation when estimated tokens exceed this ratio of contextWindowSize
-	preemptiveThresholdRatio = 0.85
+	// Upstream model context window size (JoyCode's ModelArts limit).
+	// This MUST stay >= the Ctx we advertise to clients in pkg/openai/types.go
+	// (currently 200000). Clients (e.g. Claude Code) decide when to auto-compact
+	// based on that advertised window, so our defensive truncation threshold must
+	// sit ABOVE the client's compact point — otherwise the proxy destructively
+	// truncates before the client ever gets a chance to compact cleanly.
+	contextWindowSize = 200000
+	// Safety margin: only kick in as a last-resort fuse once estimated tokens
+	// exceed this ratio of contextWindowSize. Kept high (0.95) so the client's
+	// own compaction (which triggers earlier) is always the primary mechanism;
+	// this truncation is the backstop for oversized single messages / tool
+	// results the client cannot compact away.
+	preemptiveThresholdRatio = 0.95
 	// Rough approximation: 1 token ≈ 3.5 bytes for mixed Chinese/English code content
 	bytesPerToken = 3.5
-	// Maximum truncation rounds before giving up
-	maxTruncationRounds = 5
+	// Safety bound only; normal truncation finishes in far fewer rounds.
+	maxTruncationRounds = 32
+	// Large tool output can otherwise make the retained tail impossible to send.
+	maxRetainedToolResultBytes = 32 * 1024
 )
 
 // estimateTokens gives a rough token count estimate for the request messages.
@@ -36,65 +47,82 @@ func estimateTokens(req *MessageRequest) int {
 // and proactively truncates before sending. Returns the number of truncation rounds performed.
 // Returns -1 if truncation failed to bring estimated tokens below threshold.
 func PreemptiveTruncate(req *MessageRequest) int {
-	window := float64(contextWindowSize)
-	ratio := float64(preemptiveThresholdRatio)
+	window, ratio := float64(contextWindowSize), float64(preemptiveThresholdRatio)
 	threshold := int(window * ratio)
-
 	rounds := 0
+
 	for rounds < maxTruncationRounds {
-		estimated := estimateTokens(req)
+		estimated := EstimateRequestTokens(req)
 		if estimated <= threshold {
 			if rounds > 0 {
 				slog.Info("preemptive truncation complete", "rounds", rounds, "estimated_tokens", estimated, "threshold", threshold)
 			}
 			return rounds
 		}
-		if !truncateMessages(req) {
-			slog.Warn("preemptive truncation: cannot truncate further", "estimated_tokens", estimated, "threshold", threshold, "rounds", rounds)
+
+		changed := truncateOversizedToolResults(req)
+		if !changed {
+			changed = truncateMessages(req)
+		}
+		if !changed {
+			logTruncationBreakdown(req, estimated, threshold, rounds)
 			return -1
 		}
+
+		after := EstimateRequestTokens(req)
 		rounds++
-		slog.Warn("preemptive truncation round", "round", rounds, "estimated_tokens_before", estimated, "threshold", threshold)
+		slog.Warn("preemptive truncation round", "round", rounds, "estimated_tokens_before", estimated, "estimated_tokens_after", after, "threshold", threshold)
+		if after >= estimated {
+			logTruncationBreakdown(req, after, threshold, rounds)
+			return -1
+		}
 	}
-	// Check if we actually got below threshold
-	if estimateTokens(req) > threshold {
-		slog.Warn("preemptive truncation exhausted rounds without reaching threshold")
-		return -1
-	}
-	return rounds
+
+	logTruncationBreakdown(req, EstimateRequestTokens(req), threshold, rounds)
+	return -1
 }
 
-// findToolPairBoundary adjusts cutEnd backward if it would split a tool_use/tool_result pair.
+func logTruncationBreakdown(req *MessageRequest, estimated, threshold, rounds int) {
+	maxMessageBytes, maxMessageIndex := 0, -1
+	for i, message := range req.Messages {
+		if len(message.Content) > maxMessageBytes {
+			maxMessageBytes = len(message.Content)
+			maxMessageIndex = i
+		}
+	}
+	toolsBytes := 0
+	if data, err := json.Marshal(req.Tools); err == nil {
+		toolsBytes = len(data)
+	}
+	slog.Warn("preemptive truncation cannot reach threshold",
+		"estimated_tokens", estimated,
+		"threshold", threshold,
+		"rounds", rounds,
+		"messages", len(req.Messages),
+		"system_bytes", len(req.System),
+		"tools_bytes", toolsBytes,
+		"max_message_index", maxMessageIndex,
+		"max_message_bytes", maxMessageBytes,
+	)
+}
+
+// findToolPairBoundary adjusts cutEnd so the retained suffix does not start with
+// a tool_result whose matching tool_use has been removed.
 func findToolPairBoundary(messages []MessageParam, cutEnd int) int {
-	if cutEnd <= 1 || cutEnd >= len(messages) {
+	if cutEnd <= 0 || cutEnd >= len(messages) {
 		return cutEnd
 	}
 	prevRole := messages[cutEnd-1].Role
 	curRole := messages[cutEnd].Role
 
-	// If we're splitting between assistant(tool_use) and user(tool_result), include both
 	if prevRole == "assistant" && curRole == "user" {
 		var blocks []contentBlock
 		if json.Unmarshal(messages[cutEnd-1].Content, &blocks) == nil {
 			for _, b := range blocks {
 				if b.Type == "tool_use" {
-					if cutEnd-1 >= 1 {
+					if cutEnd > 1 {
 						return cutEnd - 1
 					}
-					if cutEnd+2 < len(messages) {
-						return cutEnd + 2
-					}
-				}
-			}
-		}
-	}
-
-	// Skip orphaned tool_result whose tool_use was removed
-	if curRole == "user" {
-		var blocks []contentBlock
-		if json.Unmarshal(messages[cutEnd].Content, &blocks) == nil {
-			for _, b := range blocks {
-				if b.Type == "tool_result" {
 					if cutEnd+1 < len(messages) {
 						return cutEnd + 1
 					}
@@ -103,69 +131,77 @@ func findToolPairBoundary(messages []MessageParam, cutEnd int) int {
 		}
 	}
 
+	if curRole == "user" {
+		var blocks []contentBlock
+		if json.Unmarshal(messages[cutEnd].Content, &blocks) == nil {
+			for _, b := range blocks {
+				if b.Type == "tool_result" && cutEnd+1 < len(messages) {
+					return cutEnd + 1
+				}
+			}
+		}
+	}
 	return cutEnd
 }
 
-// truncateMessages removes the oldest messages from the middle of the
-// conversation, keeping the first message + a truncation notice + the last
-// portion of messages. Each call removes ~40% of remaining messages.
-// Returns true if truncation was performed.
+// truncateMessages removes the oldest 40% of the conversation. The first
+// message is intentionally not pinned: a very large initial prompt was the
+// reason repeated truncation previously stalled above the threshold.
 func truncateMessages(req *MessageRequest) bool {
 	n := len(req.Messages)
-	if n <= 4 {
+	if n <= 1 {
 		return false
 	}
 
-	keepFirst := 1
-	// Remove 40% of messages each round (more aggressive than before)
-	keepLast := int(float64(n) * 0.6)
-	if keepLast < 4 {
-		keepLast = 4
+	cutEnd := int(float64(n) * 0.4)
+	if cutEnd < 1 {
+		cutEnd = 1
 	}
-	cutEnd := n - keepLast
-	if cutEnd <= keepFirst {
-		// Even more aggressive: only keep first + last 2
-		keepLast = 2
-		cutEnd = n - keepLast
-		if cutEnd <= keepFirst {
-			return false
-		}
-	}
-
-	// Ensure cutEnd lands on an even index (user) for valid conversation sequence
-	if cutEnd%2 != 0 {
-		cutEnd++
-	}
-	if cutEnd >= n {
-		return false
-	}
-
-	// Adjust cutEnd to avoid splitting tool_use/tool_result pairs
 	cutEnd = findToolPairBoundary(req.Messages, cutEnd)
-	if cutEnd >= n {
+	if cutEnd <= 0 || cutEnd >= n {
 		return false
 	}
 
-	removed := cutEnd - keepFirst
 	notice := "[System: Earlier conversation messages have been auto-truncated to fit within the model's context window. Some earlier context is now missing. Continue with the remaining conversation.]"
 	noticeBytes, _ := json.Marshal(notice)
-
-	var truncated []MessageParam
-	truncated = append(truncated, req.Messages[:keepFirst]...)
-	truncated = append(truncated, MessageParam{
-		Role:    "assistant",
-		Content: json.RawMessage(noticeBytes),
-	})
+	truncated := make([]MessageParam, 0, n-cutEnd+1)
+	truncated = append(truncated, MessageParam{Role: "user", Content: json.RawMessage(noticeBytes)})
 	truncated = append(truncated, req.Messages[cutEnd:]...)
 
 	slog.Warn("auto-truncated messages for context limit",
 		"original_count", n,
 		"truncated_count", len(truncated),
-		"removed", removed,
-		"kept_first", keepFirst,
+		"removed", cutEnd,
 		"kept_last", n-cutEnd,
 	)
-
 	req.Messages = truncated
 	return true
+}
+
+// truncateOversizedToolResults replaces large retained tool outputs with a
+// marker while preserving the tool_result block and its tool_use_id.
+func truncateOversizedToolResults(req *MessageRequest) bool {
+	for messageIndex := range req.Messages {
+		var blocks []contentBlock
+		if json.Unmarshal(req.Messages[messageIndex].Content, &blocks) != nil {
+			continue
+		}
+		changed := false
+		for blockIndex := range blocks {
+			if blocks[blockIndex].Type != "tool_result" || len(blocks[blockIndex].Content) <= maxRetainedToolResultBytes {
+				continue
+			}
+			blocks[blockIndex].Content = json.RawMessage(`"[Tool result auto-truncated by proxy because it exceeded the context window.]"`)
+			changed = true
+		}
+		if changed {
+			content, err := json.Marshal(blocks)
+			if err != nil {
+				continue
+			}
+			req.Messages[messageIndex].Content = content
+			return true
+		}
+	}
+	return false
 }
