@@ -65,6 +65,40 @@ func TestPreemptiveTruncate_TruncatesSingleHugeToolResult(t *testing.T) {
 	}
 }
 
+// A new conversation containing a single large base64 image must NOT be
+// rejected as "context too long". The base64 payload is large in bytes but
+// costs only a flat per-image token amount.
+func TestPreemptiveTruncate_SingleImageIsNotContextOverflow(t *testing.T) {
+	bigBase64 := strings.Repeat("A", 1500000) // ~1.5MB base64; ~430k tokens if mis-estimated by bytes
+	imageBlock, err := json.Marshal([]map[string]any{
+		{
+			"type": "image",
+			"source": map[string]string{
+				"type":       "base64",
+				"media_type": "image/png",
+				"data":       bigBase64,
+			},
+		},
+		{"type": "text", "text": "这是什么"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := &MessageRequest{
+		Messages: []MessageParam{
+			{Role: "user", Content: imageBlock},
+		},
+	}
+
+	threshold := int(contextWindowSize * preemptiveThresholdRatio)
+	if got := EstimateRequestTokens(req); got > threshold {
+		t.Fatalf("single image wrongly estimated as overflow: got %d tokens, threshold %d", got, threshold)
+	}
+	if rounds := PreemptiveTruncate(req); rounds != 0 {
+		t.Fatalf("expected no truncation for a single image, got rounds=%d", rounds)
+	}
+}
+
 func mustRawJSON(t *testing.T, value string) json.RawMessage {
 	t.Helper()
 	data, err := json.Marshal(value)

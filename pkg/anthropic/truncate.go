@@ -25,22 +25,44 @@ const (
 	maxTruncationRounds = 32
 	// Large tool output can otherwise make the retained tail impossible to send.
 	maxRetainedToolResultBytes = 32 * 1024
+	// Flat per-image token cost. Image tokens are billed by resolution
+	// (~(w*h)/750), NOT by the size of the base64 payload. A single ~1MB
+	// base64 image is only ~1500 tokens, but its raw bytes / bytesPerToken
+	// would falsely estimate ~300k tokens and blow past the context window —
+	// which is why a brand-new conversation with just one screenshot was
+	// wrongly rejected as "context too long".
+	tokensPerImageBlock = 1600
 )
 
 // estimateTokens gives a rough token count estimate for the request messages.
-// Uses byte-length / bytesPerToken as approximation. Overestimates slightly which is safe.
+// Text is approximated by byte-length / bytesPerToken; image blocks use a flat
+// per-image cost so their large base64 payload does not distort the estimate.
 func estimateTokens(req *MessageRequest) int {
 	totalBytes := 0
 	if req.System != nil {
 		totalBytes += len(req.System)
 	}
+	imageTokens := 0
 	for _, m := range req.Messages {
+		var blocks []contentBlock
+		if json.Unmarshal(m.Content, &blocks) == nil && len(blocks) > 0 {
+			for _, b := range blocks {
+				if b.Type == "image" {
+					imageTokens += tokensPerImageBlock
+					continue
+				}
+				// Count only the non-image portion by bytes.
+				totalBytes += len(b.Text) + len(b.Content) + len(b.Input) + len(b.Name) + len(b.ID) + len(b.ToolUseID)
+			}
+			continue
+		}
+		// Not a block array (e.g. plain-text content) — fall back to raw bytes.
 		totalBytes += len(m.Content)
 	}
-	if totalBytes == 0 {
+	if totalBytes == 0 && imageTokens == 0 {
 		return 0
 	}
-	return int(float64(totalBytes) / bytesPerToken)
+	return int(float64(totalBytes)/bytesPerToken) + imageTokens
 }
 
 // PreemptiveTruncate checks if the request likely exceeds the model's context limit
