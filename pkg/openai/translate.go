@@ -109,6 +109,15 @@ func ResolveModel(model string, accountDefault string, systemDefault string) str
 			return model
 		}
 	}
+	// Some clients (e.g. Codex) send the real upstream model ID instead of the
+	// friendly label. Reverse-map it to the label before falling back.
+	if label := joycode.LabelForUpstreamID(model); label != model {
+		for _, m := range joycode.Models {
+			if m == label {
+				return label
+			}
+		}
+	}
 	if accountDefault != "" {
 		return accountDefault
 	}

@@ -41,8 +41,11 @@ type responsesInputItem struct {
 	Name      string `json:"name"`
 	Arguments string `json:"arguments"`
 	CallID    string `json:"call_id"`
-	// function_call_output fields
+	// function_call_output / custom_tool_call_output fields
 	Output json.RawMessage `json:"output"`
+	// custom_tool_call fields (Codex freeform custom tools carry their
+	// argument payload as a raw string `input` instead of `arguments`).
+	Input json.RawMessage `json:"input"`
 	// additional_tools fields (Codex embeds tool definitions inside `input`
 	// as {type:"additional_tools", role:"developer", tools:[...namespaces...]}).
 	Tools json.RawMessage `json:"tools"`
@@ -85,11 +88,6 @@ func (s *Server) handleResponses(w http.ResponseWriter, r *http.Request) {
 	}
 	jcBody := TranslateRequest(chatReq)
 
-	// DIAG: verify model resolution and tool extraction after this build.
-	toolsOut, _ := json.Marshal(jcBody["tools"])
-	slog.Info("DIAG responses resolved", "req_model", req.Model, "resolved", model,
-		"tools_len", len(chatReq.Tools), "tools", string(toolsOut))
-
 	client := s.getClient(r)
 
 	if req.Stream {
@@ -118,17 +116,44 @@ func responsesToChatRequest(req *ResponsesRequest, model string) (*ChatRequest, 
 	// Codex (Responses protocol) embeds its tool definitions inside the
 	// `input` array as `additional_tools` items rather than the top-level
 	// `tools` field. Collect them here so they survive translation.
+	//
+	// Codex also uses parallel tool calls: within a single assistant turn it
+	// emits multiple standalone `function_call` items followed by their
+	// `function_call_output` items. Chat Completions requires all tool_calls
+	// from one turn to live in ONE assistant message (a tool_calls array),
+	// immediately followed by the matching `role:"tool"` messages. So we
+	// merge consecutive function_call items into a single assistant message.
 	var embeddedTools []map[string]interface{}
+	var pendingToolCalls []map[string]interface{}
+	flushToolCalls := func() {
+		if len(pendingToolCalls) == 0 {
+			return
+		}
+		messages = append(messages, map[string]interface{}{
+			"role":       "assistant",
+			"content":    nil,
+			"tool_calls": pendingToolCalls,
+		})
+		pendingToolCalls = nil
+	}
 	for _, it := range items {
 		if it.Type == "additional_tools" {
 			embeddedTools = append(embeddedTools, extractAdditionalTools(it.Tools)...)
 			continue
 		}
+		if tc := inputItemToToolCall(it); tc != nil {
+			// Accumulate into the current assistant turn.
+			pendingToolCalls = append(pendingToolCalls, tc)
+			continue
+		}
+		// Any non tool-call item ends the current assistant tool-call turn.
+		flushToolCalls()
 		msg := inputItemToMessage(it)
 		if msg != nil {
 			messages = append(messages, msg)
 		}
 	}
+	flushToolCalls()
 
 	msgBytes, err := json.Marshal(messages)
 	if err != nil {
@@ -289,22 +314,7 @@ func inputItemToMessage(it responsesInputItem) map[string]interface{} {
 		content := parseContentParts(it.Content, role)
 		return map[string]interface{}{"role": role, "content": content}
 
-	case "function_call":
-		// Assistant message carrying a tool call.
-		return map[string]interface{}{
-			"role":    "assistant",
-			"content": nil,
-			"tool_calls": []map[string]interface{}{{
-				"id":   it.CallID,
-				"type": "function",
-				"function": map[string]interface{}{
-					"name":      it.Name,
-					"arguments": it.Arguments,
-				},
-			}},
-		}
-
-	case "function_call_output":
+	case "function_call_output", "custom_tool_call_output":
 		return map[string]interface{}{
 			"role":         "tool",
 			"tool_call_id": it.CallID,
@@ -312,6 +322,52 @@ func inputItemToMessage(it responsesInputItem) map[string]interface{} {
 		}
 	}
 	return nil
+}
+
+// inputItemToToolCall converts a Responses function_call / custom_tool_call
+// item into a single Chat tool_call object (to be merged into one assistant
+// message per turn). Returns nil for any other item type.
+func inputItemToToolCall(it responsesInputItem) map[string]interface{} {
+	switch it.Type {
+	case "function_call":
+		return map[string]interface{}{
+			"id":   it.CallID,
+			"type": "function",
+			"function": map[string]interface{}{
+				"name":      it.Name,
+				"arguments": it.Arguments,
+			},
+		}
+	case "custom_tool_call":
+		// Custom tools are down-converted into functions with a single string
+		// `input` parameter, so wrap the freeform input into {"input":"..."}.
+		return map[string]interface{}{
+			"id":   it.CallID,
+			"type": "function",
+			"function": map[string]interface{}{
+				"name":      it.Name,
+				"arguments": customInputToArguments(it.Input),
+			},
+		}
+	}
+	return nil
+}
+
+// customInputToArguments wraps a Codex custom tool's freeform `input` payload
+// into a JSON string of the shape {"input": "<text>"} so it matches the schema
+// we synthesize for down-converted custom tools.
+func customInputToArguments(raw json.RawMessage) string {
+	var s string
+	if len(raw) > 0 {
+		trimmed := strings.TrimSpace(string(raw))
+		if strings.HasPrefix(trimmed, "\"") {
+			_ = json.Unmarshal(raw, &s)
+		} else {
+			s = string(raw)
+		}
+	}
+	b, _ := json.Marshal(map[string]string{"input": s})
+	return string(b)
 }
 
 // parseContentParts flattens Responses content parts into either a plain

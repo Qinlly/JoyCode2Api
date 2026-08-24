@@ -355,6 +355,13 @@ func (s *Server) handleStreamResponses(w http.ResponseWriter, r *http.Request, c
 		}
 		store.SetTokenUsage(r, inTk, outTk)
 	}
-	_ = finishReason
+	slog.Info("responses stream: completed",
+		"model", model,
+		"finish_reason", finishReason,
+		"tool_calls", len(toolCalls),
+		"text_len", textBuf.Len(),
+		"in_tokens", inTk,
+		"out_tokens", outTk,
+	)
 	emit("response.completed", map[string]interface{}{"response": final})
 }

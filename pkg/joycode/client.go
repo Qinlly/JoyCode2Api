@@ -102,6 +102,20 @@ func UpstreamModelID(model string) string {
 	return model
 }
 
+// LabelForUpstreamID reverse-maps a real upstream model ID (e.g. "gpt-5.6-sol",
+// "Claude-Opus-4.8-hq") back to its friendly label (e.g. "GPT-5.6 Sol").
+// Clients such as Codex send the upstream ID directly rather than the label;
+// this lets ResolveModel recognize them instead of falling back to the default
+// model. Returns the input unchanged when no alias matches.
+func LabelForUpstreamID(id string) string {
+	for label, upstream := range modelIDAliases {
+		if upstream == id {
+			return label
+		}
+	}
+	return id
+}
+
 type Client struct {
 	PtKey          string
 	AnthropicPtKey string
