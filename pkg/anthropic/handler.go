@@ -715,6 +715,14 @@ func (h *Handler) handleNativeAnthropicStream(w http.ResponseWriter, r *http.Req
 	var inTk, outTk int
 	pendingEvent := ""
 	sawTerminal := false
+	// Observation-only state for diagnosing tool_use input quality on the
+	// native pass-through path. This does NOT alter forwarding — it only
+	// accumulates each tool_use block's streamed partial_json so we can log
+	// the raw input the upstream produced and whether it is valid JSON.
+	toolObsIndex := -1
+	toolObsName := ""
+	toolObsID := ""
+	var toolObsInput strings.Builder
 	for scanner.Scan() {
 		payload := unwrapNativeAnthropicSSE(scanner.Text())
 		if payload == "" {
@@ -752,6 +760,64 @@ func (h *Handler) handleNativeAnthropicStream(w http.ResponseWriter, r *http.Req
 		}
 		fmt.Fprintf(w, "data: %s\n\n", payload)
 		updateNativeAnthropicUsage(payload, &inTk, &outTk)
+		// Observation-only: track tool_use input as it streams so we can log
+		// the raw upstream input and its JSON validity (diagnosing high-freq
+		// "参数不对/格式不对" tool failures). Never mutates the forwarded bytes.
+		switch eventName {
+		case "content_block_start":
+			var ev struct {
+				Index        int `json:"index"`
+				ContentBlock struct {
+					Type  string          `json:"type"`
+					ID    string          `json:"id"`
+					Name  string          `json:"name"`
+					Input json.RawMessage `json:"input"`
+				} `json:"content_block"`
+			}
+			if json.Unmarshal([]byte(payload), &ev) == nil && ev.ContentBlock.Type == "tool_use" {
+				toolObsIndex = ev.Index
+				toolObsName = ev.ContentBlock.Name
+				toolObsID = ev.ContentBlock.ID
+				toolObsInput.Reset()
+				// Some upstreams put the full input in content_block_start
+				// instead of streaming input_json_delta.
+				if len(ev.ContentBlock.Input) > 0 && string(ev.ContentBlock.Input) != "{}" && string(ev.ContentBlock.Input) != "null" {
+					toolObsInput.Write(ev.ContentBlock.Input)
+				}
+			}
+		case "content_block_delta":
+			if toolObsIndex >= 0 {
+				var ev struct {
+					Index int `json:"index"`
+					Delta struct {
+						Type        string `json:"type"`
+						PartialJSON string `json:"partial_json"`
+					} `json:"delta"`
+				}
+				if json.Unmarshal([]byte(payload), &ev) == nil &&
+					ev.Index == toolObsIndex && ev.Delta.Type == "input_json_delta" {
+					toolObsInput.WriteString(ev.Delta.PartialJSON)
+				}
+			}
+		case "content_block_stop":
+			if toolObsIndex >= 0 {
+				raw := toolObsInput.String()
+				if raw == "" {
+					raw = "{}"
+				}
+				reqLog(r).Info("DIAG native tool_use input",
+					"tool", toolObsName,
+					"id", toolObsID,
+					"valid_json", json.Valid([]byte(raw)),
+					"input_len", len(raw),
+					"input", raw,
+				)
+				toolObsIndex = -1
+				toolObsName = ""
+				toolObsID = ""
+				toolObsInput.Reset()
+			}
+		}
 		pendingEvent = ""
 		flusher.Flush()
 	}

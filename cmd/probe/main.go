@@ -38,6 +38,48 @@ func main() {
 			"messages":   []map[string]interface{}{{"role": "user", "content": os.Getenv("PROBE_PROMPT")}},
 			"max_tokens": 2000,
 		}
+		// PROBE_TOOLS=1 attaches a function tool so we can inspect whether the
+		// upstream returns structured tool_calls or emits <tool_call> text.
+		if os.Getenv("PROBE_TOOLS") != "" {
+			body["tools"] = []map[string]interface{}{{
+				"type": "function",
+				"function": map[string]interface{}{
+					"name":        "exec_command",
+					"description": "Execute a shell command",
+					"parameters": map[string]interface{}{
+						"type": "object",
+						"properties": map[string]interface{}{
+							"cmd": map[string]interface{}{"type": "string", "description": "the command to run"},
+						},
+						"required": []string{"cmd"},
+					},
+				},
+			}}
+			body["tool_choice"] = "auto"
+		}
+		// PROBE_DUMP=1 prints the raw OpenAI SSE body instead of chunk timing.
+		if os.Getenv("PROBE_DUMP") != "" {
+			body["stream"] = true
+			dresp, derr := c.PostStream("/api/saas/openai/v1/chat/completions", body)
+			if derr != nil {
+				fmt.Printf("%s => STREAM ERROR: %v\n", name, derr)
+				continue
+			}
+			raw := make([]byte, 256*1024)
+			var full strings.Builder
+			for {
+				n, rerr := dresp.Body.Read(raw)
+				if n > 0 {
+					full.Write(raw[:n])
+				}
+				if rerr != nil {
+					break
+				}
+			}
+			dresp.Body.Close()
+			fmt.Printf("%s => RAW STREAM BODY:\n%s\n===END===\n", name, full.String())
+			continue
+		}
 		if os.Getenv("PROBE_SKIP_NONSTREAM") != "" {
 			body["stream"] = true
 			_, err := c.Post("/api/saas/openai/v1/chat/completions", body)
