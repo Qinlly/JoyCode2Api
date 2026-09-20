@@ -123,12 +123,12 @@ func TestTranslateRequest_Stop(t *testing.T) {
 // Test 8: With thinking (for reasoning model)
 func TestTranslateRequest_Thinking(t *testing.T) {
 	req := &ChatRequest{
-		Model:    "GLM-5.1",
+		Model:    "GLM-5.3",
 		Thinking: json.RawMessage(`{"type":"enabled","budget_tokens":5000}`),
 	}
 	body := TranslateRequest(req)
 	if body["thinking"] == nil {
-		t.Error("expected thinking to be set for reasoning model GLM-5.1")
+		t.Error("expected thinking to be set for reasoning model GLM-5.3")
 	}
 }
 
@@ -283,13 +283,13 @@ func TestTranslateModels_UsesLabel(t *testing.T) {
 // Test 18: Model with capabilities includes them
 func TestTranslateModels_Capabilities(t *testing.T) {
 	models := []joycode.ModelInfo{
-		{Label: "JoyAI-Code", ModelID: "JoyAI-Code"},
+		{Label: "JoyAI-Code-1.5", ModelID: "JoyAI-Code-1.5"},
 	}
 	result := TranslateModels(models)
 	data := result["data"].([]map[string]interface{})
 	caps, exists := data[0]["capabilities"]
 	if !exists {
-		t.Error("expected capabilities for JoyAI-Code")
+		t.Error("expected capabilities for JoyAI-Code-1.5")
 	}
 	capMap, ok := caps.(ModelCapability)
 	if !ok {
@@ -385,17 +385,17 @@ func TestResolveModel_Empty(t *testing.T) {
 
 // Test 25: Non-empty returns input
 func TestResolveModel_NonEmpty(t *testing.T) {
-	result := ResolveModel("GLM-5.1", "", "")
-	if result != "GLM-5.1" {
-		t.Errorf("expected GLM-5.1, got %s", result)
+	result := ResolveModel("GLM-5.3", "", "")
+	if result != "GLM-5.3" {
+		t.Errorf("expected GLM-5.3, got %s", result)
 	}
 }
 
 // Test 26: Specific model name preserved
 func TestResolveModel_SpecificName(t *testing.T) {
-	result := ResolveModel("Kimi-K2.6", "", "")
-	if result != "Kimi-K2.6" {
-		t.Errorf("expected Kimi-K2.6, got %s", result)
+	result := ResolveModel("Kimi-K3", "", "")
+	if result != "Kimi-K3" {
+		t.Errorf("expected Kimi-K3, got %s", result)
 	}
 }
 
@@ -403,14 +403,14 @@ func TestResolveModel_SpecificName(t *testing.T) {
 
 // Test 27: ReasoningModels map has expected entries
 func TestReasoningModels(t *testing.T) {
-	expected := []string{"GLM-5.1", "Kimi-K2.6", "MiniMax-M2.7"}
+	expected := []string{"GLM-5.3", "Kimi-K3", "MiniMax-M3", "Kimi-K3-jcloud"}
 	for _, m := range expected {
 		if !ReasoningModels[m] {
 			t.Errorf("expected %s to be a reasoning model", m)
 		}
 	}
 	// Verify non-reasoning models are absent
-	nonReasoning := []string{"JoyAI-Code", "GLM-5", "GLM-4.7", "Kimi-K2.5"}
+	nonReasoning := []string{"JoyAI-Code-1.5", "Claude-Opus-4.8", "JoyCode-Base-V3"}
 	for _, m := range nonReasoning {
 		if ReasoningModels[m] {
 			t.Errorf("expected %s to NOT be a reasoning model", m)
@@ -420,11 +420,7 @@ func TestReasoningModels(t *testing.T) {
 
 // Test 28: ModelCapabilities has expected entries for all known models
 func TestModelCapabilities(t *testing.T) {
-	expected := []string{
-		"JoyAI-Code", "MiniMax-M2.7", "Kimi-K2.5",
-		"Kimi-K2.6", "GLM-5.1", "GLM-5", "GLM-4.7", "Doubao-Seed-2.0-pro",
-	}
-	for _, m := range expected {
+	for _, m := range joycode.Models {
 		caps, ok := ModelCapabilities[m]
 		if !ok {
 			t.Errorf("expected capabilities for %s", m)
@@ -438,10 +434,13 @@ func TestModelCapabilities(t *testing.T) {
 		}
 	}
 	// Spot-check specific capabilities
-	if !ModelCapabilities["MiniMax-M2.7"].Reasoning {
-		t.Error("expected MiniMax-M2.7 to have Reasoning=true")
+	if !ModelCapabilities["MiniMax-M3"].Reasoning {
+		t.Error("expected MiniMax-M3 to have Reasoning=true")
 	}
-	if !ModelCapabilities["Kimi-K2.5"].Vision {
-		t.Error("expected Kimi-K2.5 to have Vision=true")
+	if !ModelCapabilities["Kimi-K3"].Vision {
+		t.Error("expected Kimi-K3 to have Vision=true")
+	}
+	if !ModelCapabilities["Kimi-K3-jcloud"].Vision {
+		t.Error("expected Kimi-K3-jcloud to have Vision=true")
 	}
 }

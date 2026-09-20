@@ -200,7 +200,7 @@ func TestModels_Get(t *testing.T) {
 	}
 }
 
-// Test 32: Server error returns 500
+// Test 32: Upstream error falls back to the hardcoded model list (200)
 func TestModels_ServerError(t *testing.T) {
 	errorBackend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(500)
@@ -225,8 +225,19 @@ func TestModels_ServerError(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 500 {
-		t.Fatalf("expected 500, got %d", resp.StatusCode)
+	if resp.StatusCode != 200 {
+		t.Fatalf("expected 200 (fallback list), got %d", resp.StatusCode)
+	}
+	var result map[string]interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		t.Fatal(err)
+	}
+	data, ok := result["data"].([]interface{})
+	if !ok {
+		t.Fatal("data is not a slice")
+	}
+	if len(data) != len(joycode.Models) {
+		t.Fatalf("expected %d fallback models, got %d", len(joycode.Models), len(data))
 	}
 }
 
@@ -302,7 +313,7 @@ func TestChat_ValidNonStream(t *testing.T) {
 	})
 	defer cleanup()
 
-	body := `{"model":"JoyAI-Code","messages":[{"role":"user","content":"hi"}],"stream":false}`
+	body := `{"model":"JoyAI-Code-1.5","messages":[{"role":"user","content":"hi"}],"stream":false}`
 	resp, err := http.Post(
 		srv.URL+"/v1/chat/completions",
 		"application/json",
@@ -320,8 +331,8 @@ func TestChat_ValidNonStream(t *testing.T) {
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		t.Fatal(err)
 	}
-	if result["model"] != "JoyAI-Code" {
-		t.Errorf("expected model=JoyAI-Code, got %v", result["model"])
+	if result["model"] != "JoyAI-Code-1.5" {
+		t.Errorf("expected model=JoyAI-Code-1.5, got %v", result["model"])
 	}
 	if result["object"] != "chat.completion" {
 		t.Errorf("expected object=chat.completion, got %v", result["object"])

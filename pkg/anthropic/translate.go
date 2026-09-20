@@ -46,9 +46,10 @@ func TranslateRequest(req *MessageRequest, accountDefault string, systemDefault 
 // Anthropic endpoint body. Claude-family models reject the legacy OpenAI path.
 func TranslateAnthropicRequest(req *MessageRequest, accountDefault string, systemDefault string) map[string]interface{} {
 	model := resolveNativeAnthropicModel(req.Model, accountDefault, systemDefault)
+	messages := stripThinkingBlocks(req.Messages)
 	body := map[string]interface{}{
 		"model":      model,
-		"messages":   req.Messages,
+		"messages":   messages,
 		"stream":     true,
 		"max_tokens": req.MaxTokens,
 		"thinking":   map[string]string{"type": "disabled"},
@@ -66,6 +67,158 @@ func TranslateAnthropicRequest(req *MessageRequest, accountDefault string, syste
 		body["tool_choice"] = json.RawMessage(req.ToolChoice)
 	}
 	return body
+}
+
+// stripThinkingBlocks removes thinking content blocks (type="thinking") from
+// each message's content. When thinking is disabled, the upstream Anthropic
+// endpoint validates the signature field on every thinking block and rejects
+// the request with "Invalid signature in thinking block" if any are present.
+// Since we force thinking:disabled, we must strip these blocks before sending.
+func stripThinkingBlocks(messages []MessageParam) []MessageParam {
+	if len(messages) == 0 {
+		return messages
+	}
+	result := make([]MessageParam, 0, len(messages))
+	for _, msg := range messages {
+		// Content can be a plain string (no thinking blocks possible) or an
+		// array of content blocks. Only arrays need filtering.
+		var blocks []map[string]json.RawMessage
+		if err := json.Unmarshal(msg.Content, &blocks); err != nil {
+			// Not a block array (likely a plain string) — keep as-is.
+			result = append(result, msg)
+			continue
+		}
+		filtered := make([]map[string]json.RawMessage, 0, len(blocks))
+		for _, b := range blocks {
+			var btype string
+			if raw, ok := b["type"]; ok {
+				_ = json.Unmarshal(raw, &btype)
+			}
+			if btype == "thinking" {
+				continue // drop thinking blocks
+			}
+			filtered = append(filtered, b)
+		}
+		if len(filtered) == 0 {
+			// All blocks were thinking — keep a minimal text block so the
+			// message is still valid (avoids upstream "empty content" errors).
+			filtered = []map[string]json.RawMessage{{"type": json.RawMessage(`"text"`), "text": json.RawMessage(`""`)}}
+		}
+		raw, err := json.Marshal(filtered)
+		if err != nil {
+			result = append(result, msg) // fallback to original on error
+			continue
+		}
+		result = append(result, MessageParam{Role: msg.Role, Content: raw})
+	}
+	return normalizeAnthropicToolIDs(result)
+}
+
+// normalizeAnthropicToolIDs enforces Bedrock's [a-zA-Z0-9_-]+ constraint and
+// keeps tool_result references aligned with their corresponding tool_use IDs.
+func normalizeAnthropicToolIDs(messages []MessageParam) []MessageParam {
+	idMap := make(map[string]string)
+	used := make(map[string]bool)
+	result := append([]MessageParam(nil), messages...)
+
+	// Reserve every already-valid ID first, so normalization never renames it
+	// merely because an earlier invalid ID sanitizes to the same value.
+	for _, msg := range result {
+		var blocks []map[string]json.RawMessage
+		if json.Unmarshal(msg.Content, &blocks) != nil {
+			continue
+		}
+		for _, block := range blocks {
+			var blockType, id string
+			_ = json.Unmarshal(block["type"], &blockType)
+			if blockType == "tool_use" && json.Unmarshal(block["id"], &id) == nil && isValidAnthropicToolID(id) {
+				used[id] = true
+				idMap[id] = id
+			}
+		}
+	}
+
+	for i, msg := range result {
+		var blocks []map[string]json.RawMessage
+		if json.Unmarshal(msg.Content, &blocks) != nil {
+			continue
+		}
+		changed := false
+		for _, block := range blocks {
+			var blockType, original string
+			_ = json.Unmarshal(block["type"], &blockType)
+			if blockType != "tool_use" || json.Unmarshal(block["id"], &original) != nil {
+				continue
+			}
+			normalized, known := idMap[original]
+			if !known {
+				normalized = sanitizeAnthropicToolID(original)
+				base := normalized
+				for suffix := 2; used[normalized]; suffix++ {
+					normalized = fmt.Sprintf("%s_%d", base, suffix)
+				}
+				used[normalized] = true
+				idMap[original] = normalized
+			}
+			if normalized != original {
+				block["id"], _ = json.Marshal(normalized)
+				changed = true
+			}
+		}
+		if changed {
+			result[i].Content, _ = json.Marshal(blocks)
+		}
+	}
+
+	for i, msg := range result {
+		var blocks []map[string]json.RawMessage
+		if json.Unmarshal(msg.Content, &blocks) != nil {
+			continue
+		}
+		changed := false
+		for _, block := range blocks {
+			var blockType, original string
+			_ = json.Unmarshal(block["type"], &blockType)
+			if blockType != "tool_result" || json.Unmarshal(block["tool_use_id"], &original) != nil {
+				continue
+			}
+			if normalized, ok := idMap[original]; ok && normalized != original {
+				block["tool_use_id"], _ = json.Marshal(normalized)
+				changed = true
+			}
+		}
+		if changed {
+			result[i].Content, _ = json.Marshal(blocks)
+		}
+	}
+	return result
+}
+
+func isValidAnthropicToolID(id string) bool {
+	if id == "" {
+		return false
+	}
+	for _, r := range id {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '-') {
+			return false
+		}
+	}
+	return true
+}
+
+func sanitizeAnthropicToolID(id string) string {
+	var normalized strings.Builder
+	for _, r := range id {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '-' {
+			normalized.WriteRune(r)
+		} else {
+			normalized.WriteByte('_')
+		}
+	}
+	if normalized.Len() == 0 {
+		return "toolu_" + newID()
+	}
+	return normalized.String()
 }
 
 func normalizeAnthropicSystem(raw json.RawMessage) interface{} {

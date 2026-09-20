@@ -135,6 +135,10 @@ func (h *Handler) handleNonStream(w http.ResponseWriter, r *http.Request, req *M
 				return
 			}
 			reqLog(r).Error("non-stream retry error", "attempt", attempt, "max", maxRetries, "error", lastErr)
+			if !isRetryableNonStreamError(lastErr) {
+				reqLog(r).Warn("non-stream non-retryable upstream error", "attempt", attempt, "error", lastErr)
+				break
+			}
 			if attempt < maxRetries {
 				time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
 			}
@@ -354,78 +358,171 @@ func (h *Handler) handleStream(w http.ResponseWriter, r *http.Request, req *Mess
 	toolBlockStarted := map[int]bool{}
 	toolBlockToIdx := map[int]int{}
 
-	scanner := bufio.NewScanner(resp.Body)
-	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	const maxContinuationAttempts = 2
+	continuationAttempts := 0
+	var fullText strings.Builder
+	var fullReasoning strings.Builder
+	baseMessages, _ := jcBody["messages"].([]map[string]interface{})
+	baseMessages = append([]map[string]interface{}(nil), baseMessages...)
+
 	chunkCount := 0
 	var streamInTk, streamOutTk int
 	finishReasonSeen := false
+	var streamErr error
 
-	for scanner.Scan() {
-		line := scanner.Text()
-		chunkCount++
-		chunk := ParseStreamChunk(line)
-		if chunk == nil || len(chunk.Choices) == 0 {
-			if chunk != nil && chunk.Usage != nil {
+	for {
+		scanner := bufio.NewScanner(resp.Body)
+		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+
+		for scanner.Scan() {
+			line := scanner.Text()
+			chunkCount++
+			chunk := ParseStreamChunk(line)
+			if chunk == nil || len(chunk.Choices) == 0 {
+				if chunk != nil && chunk.Usage != nil {
+					streamInTk = chunk.Usage.PromptTokens
+					streamOutTk = chunk.Usage.CompletionTokens
+				}
+				continue
+			}
+			choice := chunk.Choices[0]
+			if chunk.Usage != nil {
 				streamInTk = chunk.Usage.PromptTokens
 				streamOutTk = chunk.Usage.CompletionTokens
 			}
-			continue
-		}
-		choice := chunk.Choices[0]
-		if chunk.Usage != nil {
-			streamInTk = chunk.Usage.PromptTokens
-			streamOutTk = chunk.Usage.CompletionTokens
-		}
-		// DIAGNOSTIC: what did the parser extract from this delta?
-		if chunkCount <= 5 {
-			fr := ""
-			if choice.FinishReason != nil {
-				fr = *choice.FinishReason
+			// DIAGNOSTIC: what did the parser extract from this delta?
+			if chunkCount <= 5 {
+				fr := ""
+				if choice.FinishReason != nil {
+					fr = *choice.FinishReason
+				}
+				reqLog(r).Info("DIAG parsed delta",
+					"n", chunkCount,
+					"content_len", len(choice.Delta.Content),
+					"reasoning_len", len(choice.Delta.ReasoningContent),
+					"tool_calls", len(choice.Delta.ToolCalls),
+					"finish_reason", fr,
+				)
 			}
-			reqLog(r).Info("DIAG parsed delta",
-				"n", chunkCount,
-				"content_len", len(choice.Delta.Content),
-				"reasoning_len", len(choice.Delta.ReasoningContent),
-				"tool_calls", len(choice.Delta.ToolCalls),
-				"finish_reason", fr,
-			)
-		}
 
-		// DIAGNOSTIC: what did the parser extract from this delta?
-		if chunkCount <= 5 {
-			fr := ""
-			if choice.FinishReason != nil {
-				fr = *choice.FinishReason
+			// DIAGNOSTIC: what did the parser extract from this delta?
+			if chunkCount <= 5 {
+				fr := ""
+				if choice.FinishReason != nil {
+					fr = *choice.FinishReason
+				}
+				reqLog(r).Info("DIAG parsed delta",
+					"n", chunkCount,
+					"content_len", len(choice.Delta.Content),
+					"reasoning_len", len(choice.Delta.ReasoningContent),
+					"tool_calls", len(choice.Delta.ToolCalls),
+					"finish_reason", fr,
+				)
 			}
-			reqLog(r).Info("DIAG parsed delta",
-				"n", chunkCount,
-				"content_len", len(choice.Delta.Content),
-				"reasoning_len", len(choice.Delta.ReasoningContent),
-				"tool_calls", len(choice.Delta.ToolCalls),
-				"finish_reason", fr,
-			)
-		}
 
-		for _, tc := range choice.Delta.ToolCalls {
-			idx := tc.Index
-			if _, exists := toolCalls[idx]; !exists {
-				toolCalls[idx] = &toolCallAccum{
-					ID:   tc.ID,
-					Name: tc.Function.Name,
+			for _, tc := range choice.Delta.ToolCalls {
+				idx := tc.Index
+				if _, exists := toolCalls[idx]; !exists {
+					toolCalls[idx] = &toolCallAccum{
+						ID:   tc.ID,
+						Name: tc.Function.Name,
+					}
+				}
+				if tc.ID != "" {
+					toolCalls[idx].ID = tc.ID
+				}
+				if tc.Function.Name != "" {
+					toolCalls[idx].Name = tc.Function.Name
+				}
+				toolCalls[idx].Arguments += tc.Function.Arguments
+
+				if !toolBlockStarted[idx] {
+					// If a thinking block is still open (reasoning followed
+					// directly by a tool call with no visible text), close it
+					// before starting the tool block.
+					if thinkingBlockOpen {
+						thinkingBlockOpen = false
+						FormatSSE(w, "content_block_stop", sseContentBlockStop{
+							Type: "content_block_stop", Index: thinkingBlockIndex,
+						})
+						flusher.Flush()
+					}
+					if textBlockStarted {
+						FormatSSE(w, "content_block_stop", sseContentBlockStop{
+							Type: "content_block_stop", Index: currentBlockIndex,
+						})
+						currentBlockIndex++
+						textBlockStarted = false
+					}
+					toolBlockStarted[idx] = true
+					toolBlockToIdx[idx] = currentBlockIndex
+					tcID := toolCalls[idx].ID
+					if tcID == "" {
+						tcID = "toolu_" + newID()
+					}
+					FormatSSE(w, "content_block_start", sseContentBlockStart{
+						Type:  "content_block_start",
+						Index: currentBlockIndex,
+						ContentBlock: ContentBlock{
+							Type:  "tool_use",
+							ID:    tcID,
+							Name:  toolCalls[idx].Name,
+							Input: json.RawMessage("{}"),
+						},
+					})
+					flusher.Flush()
+					currentBlockIndex++
 				}
 			}
-			if tc.ID != "" {
-				toolCalls[idx].ID = tc.ID
-			}
-			if tc.Function.Name != "" {
-				toolCalls[idx].Name = tc.Function.Name
-			}
-			toolCalls[idx].Arguments += tc.Function.Arguments
 
-			if !toolBlockStarted[idx] {
-				// If a thinking block is still open (reasoning followed
-				// directly by a tool call with no visible text), close it
-				// before starting the tool block.
+			// Reasoning is emitted as a native Anthropic thinking content block
+			// (content_block_start type=thinking + thinking_delta) so clients like
+			// Claude Code render it with their native collapsible thinking UI
+			// instead of printing raw <thinking> tags in the visible text.
+			reasoning := choice.Delta.ReasoningContent
+			if reasoning != "" {
+				if !thinkingBlockOpen {
+					if textBlockStarted {
+						// Rare: reasoning resumed after visible text; close the
+						// text block so the thinking block is well-formed.
+						FormatSSE(w, "content_block_stop", sseContentBlockStop{
+							Type: "content_block_stop", Index: currentBlockIndex,
+						})
+						currentBlockIndex++
+						textBlockStarted = false
+					}
+					thinkingBlockOpen = true
+					thinkingBlockIndex = currentBlockIndex
+					FormatSSE(w, "content_block_start", sseContentBlockStart{
+						Type:         "content_block_start",
+						Index:        currentBlockIndex,
+						ContentBlock: ContentBlock{Type: "thinking", Thinking: ""},
+					})
+					currentBlockIndex++
+					flusher.Flush()
+				}
+				fullReasoning.WriteString(reasoning)
+				totalOutput += len(reasoning)
+				FormatSSE(w, "content_block_delta", sseContentBlockDelta{
+					Type:  "content_block_delta",
+					Index: thinkingBlockIndex,
+					Delta: deltaText{Type: "thinking_delta", Thinking: reasoning},
+				})
+				flusher.Flush()
+			}
+
+			text := choice.Delta.Content
+			if text != "" {
+				if !textBlockStarted {
+					textBlockStarted = true
+					FormatSSE(w, "content_block_start", sseContentBlockStart{
+						Type:         "content_block_start",
+						Index:        currentBlockIndex,
+						ContentBlock: ContentBlock{Type: "text", Text: ""},
+					})
+					flusher.Flush()
+				}
+				// Close the thinking block before the first real text output
 				if thinkingBlockOpen {
 					thinkingBlockOpen = false
 					FormatSSE(w, "content_block_stop", sseContentBlockStop{
@@ -433,186 +530,159 @@ func (h *Handler) handleStream(w http.ResponseWriter, r *http.Request, req *Mess
 					})
 					flusher.Flush()
 				}
-				if textBlockStarted {
-					FormatSSE(w, "content_block_stop", sseContentBlockStop{
-						Type: "content_block_stop", Index: currentBlockIndex,
-					})
-					currentBlockIndex++
-					textBlockStarted = false
-				}
-				toolBlockStarted[idx] = true
-				toolBlockToIdx[idx] = currentBlockIndex
-				tcID := toolCalls[idx].ID
-				if tcID == "" {
-					tcID = "toolu_" + newID()
-				}
-				FormatSSE(w, "content_block_start", sseContentBlockStart{
-					Type:  "content_block_start",
+				fullText.WriteString(text)
+				totalOutput += len(text)
+				FormatSSE(w, "content_block_delta", sseContentBlockDelta{
+					Type:  "content_block_delta",
 					Index: currentBlockIndex,
-					ContentBlock: ContentBlock{
-						Type:  "tool_use",
-						ID:    tcID,
-						Name:  toolCalls[idx].Name,
-						Input: json.RawMessage("{}"),
-					},
+					Delta: deltaText{Type: "text_delta", Text: text},
 				})
 				flusher.Flush()
-				currentBlockIndex++
 			}
-		}
 
-		// Reasoning is emitted as a native Anthropic thinking content block
-		// (content_block_start type=thinking + thinking_delta) so clients like
-		// Claude Code render it with their native collapsible thinking UI
-		// instead of printing raw <thinking> tags in the visible text.
-		reasoning := choice.Delta.ReasoningContent
-		if reasoning != "" {
-			if !thinkingBlockOpen {
+			if choice.FinishReason != nil {
+				fr := *choice.FinishReason
+				finishReasonSeen = true
+				reqLog(r).Info("stream completed", "chunks", chunkCount, "reason", fr, "tools", len(toolCalls))
+
+				// Close a still-open thinking block at stream end (reasoning with
+				// no following visible text). Its index was already consumed when
+				// opened, so no currentBlockIndex bookkeeping is needed here.
+				if thinkingBlockOpen {
+					thinkingBlockOpen = false
+					FormatSSE(w, "content_block_stop", sseContentBlockStop{
+						Type: "content_block_stop", Index: thinkingBlockIndex,
+					})
+					flusher.Flush()
+				}
+
+				// Ensure at least one content block exists — Anthropic SDK requires it
+				if !textBlockStarted && len(toolBlockStarted) == 0 && currentBlockIndex == 0 {
+					textBlockStarted = true
+					FormatSSE(w, "content_block_start", sseContentBlockStart{
+						Type:         "content_block_start",
+						Index:        currentBlockIndex,
+						ContentBlock: ContentBlock{Type: "text", Text: ""},
+					})
+					flusher.Flush()
+				}
+
 				if textBlockStarted {
-					// Rare: reasoning resumed after visible text; close the
-					// text block so the thinking block is well-formed.
 					FormatSSE(w, "content_block_stop", sseContentBlockStop{
 						Type: "content_block_stop", Index: currentBlockIndex,
 					})
 					currentBlockIndex++
 					textBlockStarted = false
 				}
-				thinkingBlockOpen = true
-				thinkingBlockIndex = currentBlockIndex
-				FormatSSE(w, "content_block_start", sseContentBlockStart{
-					Type:         "content_block_start",
-					Index:        currentBlockIndex,
-					ContentBlock: ContentBlock{Type: "thinking", Thinking: ""},
-				})
-				currentBlockIndex++
-				flusher.Flush()
-			}
-			totalOutput += len(reasoning)
-			FormatSSE(w, "content_block_delta", sseContentBlockDelta{
-				Type:  "content_block_delta",
-				Index: thinkingBlockIndex,
-				Delta: deltaText{Type: "thinking_delta", Thinking: reasoning},
-			})
-			flusher.Flush()
-		}
-
-		text := choice.Delta.Content
-		if text !="" {
-			if !textBlockStarted {
-				textBlockStarted = true
-				FormatSSE(w, "content_block_start", sseContentBlockStart{
-					Type:         "content_block_start",
-					Index:        currentBlockIndex,
-					ContentBlock: ContentBlock{Type: "text", Text: ""},
-				})
-				flusher.Flush()
-			}
-			// Close the thinking block before the first real text output
-			if thinkingBlockOpen {
-				thinkingBlockOpen = false
-				FormatSSE(w, "content_block_stop", sseContentBlockStop{
-					Type: "content_block_stop", Index: thinkingBlockIndex,
-				})
-				flusher.Flush()
-			}
-			totalOutput += len(text)
-			FormatSSE(w, "content_block_delta", sseContentBlockDelta{
-				Type:  "content_block_delta",
-				Index: currentBlockIndex,
-				Delta: deltaText{Type: "text_delta", Text: text},
-			})
-			flusher.Flush()
-		}
-
-		if choice.FinishReason != nil {
-			fr := *choice.FinishReason
-			finishReasonSeen = true
-			reqLog(r).Info("stream completed", "chunks", chunkCount, "reason", fr, "tools", len(toolCalls))
-
-			// Close a still-open thinking block at stream end (reasoning with
-			// no following visible text). Its index was already consumed when
-			// opened, so no currentBlockIndex bookkeeping is needed here.
-			if thinkingBlockOpen {
-				thinkingBlockOpen = false
-				FormatSSE(w, "content_block_stop", sseContentBlockStop{
-					Type: "content_block_stop", Index: thinkingBlockIndex,
-				})
-				flusher.Flush()
-			}
-
-			// Ensure at least one content block exists — Anthropic SDK requires it
-			if !textBlockStarted && len(toolBlockStarted) == 0 && currentBlockIndex == 0 {
-				textBlockStarted = true
-				FormatSSE(w, "content_block_start", sseContentBlockStart{
-					Type:         "content_block_start",
-					Index:        currentBlockIndex,
-					ContentBlock: ContentBlock{Type: "text", Text: ""},
-				})
-				flusher.Flush()
-			}
-
-			if textBlockStarted {
-				FormatSSE(w, "content_block_stop", sseContentBlockStop{
-					Type: "content_block_stop", Index: currentBlockIndex,
-				})
-				currentBlockIndex++
-				textBlockStarted = false
-			}
-			for i := 0; i < len(toolCalls); i++ {
-				if toolBlockStarted[i] {
-					args := toolCalls[i].Arguments
-					if args == "" || !json.Valid([]byte(args)) {
-						args = "{}"
+				for i := 0; i < len(toolCalls); i++ {
+					if toolBlockStarted[i] {
+						args := toolCalls[i].Arguments
+						if args == "" || !json.Valid([]byte(args)) {
+							args = "{}"
+						}
+						FormatSSE(w, "content_block_delta", sseContentBlockDelta{
+							Type:  "content_block_delta",
+							Index: toolBlockToIdx[i],
+							Delta: deltaText{Type: "input_json_delta", PartialJSON: args},
+						})
+						FormatSSE(w, "content_block_stop", sseContentBlockStop{
+							Type: "content_block_stop", Index: toolBlockToIdx[i],
+						})
 					}
-					FormatSSE(w, "content_block_delta", sseContentBlockDelta{
-						Type:  "content_block_delta",
-						Index: toolBlockToIdx[i],
-						Delta: deltaText{Type: "input_json_delta", PartialJSON: args},
-					})
-					FormatSSE(w, "content_block_stop", sseContentBlockStop{
-						Type: "content_block_stop", Index: toolBlockToIdx[i],
-					})
 				}
-			}
 
-			if fr == "content_filter" {
-				// Don't disguise a filter-truncated turn as a clean end_turn
-				// (issue #2). Blocks are already closed above; surface an error.
-				reqLog(r).Warn("upstream content_filter mid-stream, surfacing as error")
-				writeStreamError(w, flusher, "上游内容安全策略拦截了本次回复，输出可能不完整。结束原因: content_filter")
-			} else {
-				stopReason := "end_turn"
-				switch fr {
-				case "tool_calls":
-					stopReason = "tool_use"
-				case "length":
-					stopReason = "max_tokens"
-				case "stop":
-					stopReason = "end_turn"
+				if fr == "content_filter" {
+					// Don't disguise a filter-truncated turn as a clean end_turn
+					// (issue #2). Blocks are already closed above; surface an error.
+					reqLog(r).Warn("upstream content_filter mid-stream, surfacing as error")
+					writeStreamError(w, flusher, "上游内容安全策略拦截了本次回复，输出可能不完整。结束原因: content_filter")
+				} else {
+					stopReason := "end_turn"
+					switch fr {
+					case "tool_calls":
+						stopReason = "tool_use"
+					case "length":
+						stopReason = "max_tokens"
+					case "stop":
+						stopReason = "end_turn"
+					}
+					FormatSSE(w, "message_delta", sseMessageDelta{
+						Type:  "message_delta",
+						Delta: deltaStop{StopReason: stopReason},
+						Usage: struct {
+							OutputTokens int `json:"output_tokens"`
+						}{OutputTokens: totalOutput / 4},
+					})
+					FormatSSE(w, "message_stop", sseMessageStop{Type: "message_stop"})
+					flusher.Flush()
 				}
-				FormatSSE(w, "message_delta", sseMessageDelta{
-					Type:  "message_delta",
-					Delta: deltaStop{StopReason: stopReason},
-					Usage: struct {
-						OutputTokens int `json:"output_tokens"`
-					}{OutputTokens: totalOutput / 4},
-				})
-				FormatSSE(w, "message_stop", sseMessageStop{Type: "message_stop"})
-				flusher.Flush()
 			}
 		}
+
+		streamErr = scanner.Err()
+		resp.Body.Close()
+		if finishReasonSeen {
+			break
+		}
+
+		// A tool call may contain partial JSON and its content block has already
+		// been exposed to the client. It cannot be safely reconstructed by asking
+		// the model to continue, so preserve the existing hard-failure behavior.
+		canContinue := len(toolBlockStarted) == 0 &&
+			(fullText.Len() > 0 || fullReasoning.Len() > 0) &&
+			continuationAttempts < maxContinuationAttempts
+		if !canContinue {
+			break
+		}
+
+		continuationAttempts++
+		assistant := map[string]interface{}{
+			"role":    "assistant",
+			"content": fullText.String(),
+		}
+		if fullReasoning.Len() > 0 {
+			assistant["reasoning_content"] = fullReasoning.String()
+		}
+		continuationMessages := append([]map[string]interface{}(nil), baseMessages...)
+		continuationMessages = append(continuationMessages,
+			assistant,
+			map[string]interface{}{
+				"role":    "user",
+				"content": "请从上一条回复被截断的位置直接继续。不要重复任何已经输出的内容，不要解释中断原因。",
+			},
+		)
+		continuationBody := make(map[string]interface{}, len(jcBody))
+		for key, value := range jcBody {
+			continuationBody[key] = value
+		}
+		continuationBody["messages"] = continuationMessages
+		continuationBody["stream"] = true
+
+		reqLog(r).Warn("upstream stream interrupted; attempting transparent continuation",
+			"attempt", continuationAttempts,
+			"max_attempts", maxContinuationAttempts,
+			"chunks", chunkCount,
+			"text_bytes", fullText.Len(),
+			"reasoning_bytes", fullReasoning.Len(),
+			"read_error", streamErr,
+		)
+		FormatSSE(w, "ping", ssePing{Type: "ping"})
+		flusher.Flush()
+
+		resp, err = h.connectStreamWithRetry(r, continuationBody, client)
+		if err != nil {
+			streamErr = fmt.Errorf("transparent continuation attempt %d failed: %w", continuationAttempts, err)
+			reqLog(r).Error("transparent continuation connection failed",
+				"attempt", continuationAttempts, "error", err)
+			break
+		}
+		streamErr = nil
 	}
 
-	// If the loop ended without ever seeing an upstream finish_reason, the stream
-	// was truncated — a read error (scanner.Err) or a clean EOF mid-generation.
-	// Don't fake a clean completion (issue #2): close any open content blocks for
-	// well-formed SSE, then surface an error event so the client shows a failure
-	// (and can retry) instead of a silent truncated "success". If finishReasonSeen
-	// is true the loop already emitted message_stop, so a trailing read error after
-	// a complete answer is ignored.
+	// If all continuation attempts were exhausted, close open blocks and expose
+	// the truncation as an error. A completed continuation has already emitted
+	// message_stop and skips this branch.
 	if !finishReasonSeen {
-		// Close a still-open thinking block so the client receives a
-		// well-formed block boundary on a truncated stream.
 		if thinkingBlockOpen {
 			thinkingBlockOpen = false
 			FormatSSE(w, "content_block_stop", sseContentBlockStop{
@@ -634,11 +704,11 @@ func (h *Handler) handleStream(w http.ResponseWriter, r *http.Request, req *Mess
 				})
 			}
 		}
-		if err := scanner.Err(); err != nil {
-			reqLog(r).Error("stream ended abnormally before finish_reason", "error", err, "chunks", chunkCount)
-			writeStreamError(w, flusher, "读取上游流式响应失败，本次回复不完整，请重试。原始错误: "+err.Error())
+		if streamErr != nil {
+			reqLog(r).Error("stream ended abnormally before finish_reason", "error", streamErr, "chunks", chunkCount, "continuations", continuationAttempts)
+			writeStreamError(w, flusher, "读取上游流式响应失败，本次回复不完整，请重试。原始错误: "+streamErr.Error())
 		} else {
-			reqLog(r).Warn("stream closed before finish_reason (premature upstream close)", "chunks", chunkCount)
+			reqLog(r).Warn("stream closed before finish_reason after continuation attempts", "chunks", chunkCount, "continuations", continuationAttempts)
 			writeStreamError(w, flusher, "上游在返回结束标记前断开了流式响应，本次回复可能不完整，请重试。")
 		}
 	}
@@ -1132,6 +1202,17 @@ func (h *Handler) connectStreamWithRetry(r *http.Request, jcBody map[string]inte
 			resp.Body.Close()
 			lastErr = fmt.Errorf("read first line: %w", err)
 			reqLog(r).Error("stream read first line", "attempt", attempt, "max", maxRetries, "error", lastErr)
+
+			// HTTP 200 followed by an immediate EOF repeatedly indicates that this
+			// model/upstream does not currently provide an SSE stream. Retrying the
+			// full configured count only delays the already available non-stream
+			// fallback. Probe twice to tolerate a transient empty response, then let
+			// the caller fall back immediately. Partial first-line reads and other
+			// connection errors retain the normal retry policy.
+			if err == io.EOF && len(firstLine) == 0 && attempt >= 2 {
+				reqLog(r).Warn("stream immediate EOF threshold reached, falling back early", "attempt", attempt, "max", maxRetries)
+				return nil, lastErr
+			}
 			if attempt < maxRetries {
 				time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
 			}
@@ -1196,6 +1277,16 @@ func (h *Handler) connectStreamWithRetry(r *http.Request, jcBody map[string]inte
 // isTimeoutError checks if the error is caused by an upstream timeout.
 func isTimeoutError(err error) bool {
 	return common.IsTimeoutError(err)
+}
+
+// isRetryableNonStreamError reports whether repeating the same non-stream request
+// may recover. HTTP 200 error envelopes are completed business responses,so
+// retrying them only delays the error returned to the client.
+func isRetryableNonStreamError(err error) bool {
+	if err == nil {
+		return false
+	}
+	return !strings.HasPrefix(err.Error(), "上游错误 ")
 }
 
 // isContextLimitError checks if the upstream error indicates context length exceeded.

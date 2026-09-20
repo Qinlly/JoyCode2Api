@@ -20,11 +20,11 @@ type CredentialStatus struct {
 
 // Keeper runs periodic keep-alive checks for all accounts.
 type Keeper struct {
-	store    *store.Store
-	mu       sync.RWMutex
-	status   map[string]*CredentialStatus
-	running  bool
-	stopCh   chan struct{}
+	store      *store.Store
+	mu         sync.RWMutex
+	status     map[string]*CredentialStatus
+	running    bool
+	stopCh     chan struct{}
 	refreshTTL time.Duration // max age before an account needs refresh
 }
 
@@ -58,6 +58,17 @@ func (k *Keeper) GetAllStatuses() map[string]*CredentialStatus {
 		result[key] = val
 	}
 	return result
+}
+
+// CredentialUpdated clears cached status and immediately validates new credentials.
+func (k *Keeper) CredentialUpdated(apiKey, ptKey, userID string) bool {
+	k.mu.Lock()
+	delete(k.status, apiKey)
+	k.mu.Unlock()
+
+	slog.Info("keepalive: validating updated credential", "user_id", userID)
+	result := k.checkOne(apiKey, ptKey, userID)
+	return result == "valid" || result == "refreshed"
 }
 
 // Start begins the periodic keep-alive loop.

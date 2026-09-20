@@ -109,9 +109,11 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 	}
 	models, err := s.getClient(r).ListModels()
 	if err != nil {
-		slog.Error("list models upstream error", "error", err)
-		writeError(w, 500, err.Error())
-		return
+		slog.Warn("list models upstream error, falling back to hardcoded list", "error", err)
+		models = make([]joycode.ModelInfo, 0, len(joycode.Models))
+		for _, id := range joycode.Models {
+			models = append(models, joycode.ModelInfo{ModelID: id, Label: id})
+		}
 	}
 	writeJSON(w, 200, TranslateModels(models))
 }

@@ -21,19 +21,24 @@ import SvgClaudeCode from '../components/ClaudeCodeIcon';
 import SvgCodex from '../components/CodexIcon';
 import CommandTooltip from '../components/CommandTooltip';
 
+// 与后端 joycode.Models 保持同步（2026-08-31 上游 ListModels）
 const BUILTIN_MODELS = [
-  { label: 'JoyAI-Code（推荐）', value: 'JoyAI-Code' },
+  { label: 'JoyAI-Code-1.5（推荐）', value: 'JoyAI-Code-1.5' },
+  { label: 'Claude-Opus-4.8', value: 'Claude-Opus-4.8' },
   { label: 'Claude-Opus-4.7', value: 'Claude-Opus-4.7' },
-  { label: 'GLM-5.1', value: 'GLM-5.1' },
-  { label: 'GLM-5', value: 'GLM-5' },
-  { label: 'GLM-4.7', value: 'GLM-4.7' },
-  { label: 'Kimi-K2.6', value: 'Kimi-K2.6' },
-  { label: 'Kimi-K2.5', value: 'Kimi-K2.5' },
-  { label: 'MiniMax-M2.7', value: 'MiniMax-M2.7' },
+  { label: 'Claude-Sonnet-4.6', value: 'Claude-Sonnet-4.6' },
+  { label: 'Claude-Opus-4.6', value: 'Claude-Opus-4.6' },
+  { label: 'GLM-5.3', value: 'GLM-5.3' },
+  { label: 'GLM-5.2-jcloud', value: 'GLM-5.2-jcloud' },
+  { label: 'Kimi-K3', value: 'Kimi-K3' },
+  { label: 'Kimi-K3-jcloud', value: 'Kimi-K3-jcloud' },
+  { label: 'DeepSeek-V4-Pro', value: 'DeepSeek-V4-Pro' },
+  { label: 'MiniMax-M3', value: 'MiniMax-M3' },
   { label: 'Doubao-Seed-2.0-pro', value: 'Doubao-Seed-2.0-pro' },
+  { label: 'GPT-5.6 Sol', value: 'GPT-5.6 Sol' },
 ];
 
-const isClaudeModel = (model?: string) => model === 'Claude-Opus-4.7';
+const isClaudeModel = (model?: string) => model?.startsWith('Claude-') ?? false;
 
 const PIE_COLORS = ['#22C55E', '#3B82F6', '#F59E0B', '#EF4444', '#A855F7', '#06B6D4', '#EC4899', '#84CC16'];
 
@@ -66,7 +71,9 @@ const statusTag = (code: number) => {
 
 const formatTime = (t: string) => {
   if (!t) return '-';
-  const d = new Date(t + (t.includes('Z') || t.includes('+') ? '' : 'Z'));
+  // 后端存储(created_at)已是本地时间(SQLite datetime('now','localtime')),
+  // 无 Z/+ 后缀的字符串必须按本地时间解析,否则会被当作 UTC 再 +8 小时显示
+  const d = new Date(t.includes('Z') || t.includes('+') ? t : t.replace(' ', 'T'));
   if (isNaN(d.getTime())) return t;
   const pad = (n: number) => String(n).padStart(2, '0');
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
@@ -84,7 +91,7 @@ const formatLatency = (ms: number) => {
 
 const getBaseURL = () => `${window.location.protocol}//${window.location.host}`;
 
-const buildClaudeCodeCmd = (apiKey: string, model = 'GLM-5.1') => [
+const buildClaudeCodeCmd = (apiKey: string, model = 'JoyAI-Code-1.5') => [
   `API_TIMEOUT_MS=6000000 \\`,
   `CLAUDE_CODE_MAX_RETRIES=3 \\`,
   `NODE_TLS_REJECT_UNAUTHORIZED=0 \\`,
@@ -95,7 +102,7 @@ const buildClaudeCodeCmd = (apiKey: string, model = 'GLM-5.1') => [
   `claude --dangerously-skip-permissions`,
 ].join('\n');
 
-const buildCodexCmd = (apiKey: string, model = 'GLM-5.1') => [
+const buildCodexCmd = (apiKey: string, model = 'JoyAI-Code-1.5') => [
   `OPENAI_BASE_URL=${getBaseURL()}/v1 \\`,
   `OPENAI_API_KEY="${apiKey}" \\`,
   `OPENAI_MODEL=${model} \\`,

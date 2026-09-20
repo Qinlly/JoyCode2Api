@@ -34,19 +34,24 @@ import { useNavigate } from 'react-router-dom';
 import { api, accountDisplayName } from '../api';
 import type { Account } from '../api';
 
+// 与后端 joycode.Models 保持同步（2026-08-31 上游 ListModels）
 const BUILTIN_MODELS = [
-  { label: 'JoyAI-Code（推荐）', value: 'JoyAI-Code' },
+  { label: 'JoyAI-Code-1.5（推荐）', value: 'JoyAI-Code-1.5' },
+  { label: 'Claude-Opus-4.8', value: 'Claude-Opus-4.8' },
   { label: 'Claude-Opus-4.7', value: 'Claude-Opus-4.7' },
-  { label: 'GLM-5.1', value: 'GLM-5.1' },
-  { label: 'GLM-5', value: 'GLM-5' },
-  { label: 'GLM-4.7', value: 'GLM-4.7' },
-  { label: 'Kimi-K2.6', value: 'Kimi-K2.6' },
-  { label: 'Kimi-K2.5', value: 'Kimi-K2.5' },
-  { label: 'MiniMax-M2.7', value: 'MiniMax-M2.7' },
+  { label: 'Claude-Sonnet-4.6', value: 'Claude-Sonnet-4.6' },
+  { label: 'Claude-Opus-4.6', value: 'Claude-Opus-4.6' },
+  { label: 'GLM-5.3', value: 'GLM-5.3' },
+  { label: 'GLM-5.2-jcloud', value: 'GLM-5.2-jcloud' },
+  { label: 'Kimi-K3', value: 'Kimi-K3' },
+  { label: 'Kimi-K3-jcloud', value: 'Kimi-K3-jcloud' },
+  { label: 'DeepSeek-V4-Pro', value: 'DeepSeek-V4-Pro' },
+  { label: 'MiniMax-M3', value: 'MiniMax-M3' },
   { label: 'Doubao-Seed-2.0-pro', value: 'Doubao-Seed-2.0-pro' },
+  { label: 'GPT-5.6 Sol', value: 'GPT-5.6 Sol' },
 ];
 
-const isClaudeModel = (model?: string) => model === 'Claude-Opus-4.7';
+const isClaudeModel = (model?: string) => model?.startsWith('Claude-') ?? false;
 
 const claudeDockerHint = [
   `docker run -d \\`,
@@ -65,7 +70,7 @@ const fmtTokens = (n: number): string => {
   return String(n);
 };
 
-const claudeCodeCmd = (apiKey: string, model = 'GLM-5.1') => [
+const claudeCodeCmd = (apiKey: string, model = 'JoyAI-Code-1.5') => [
   `API_TIMEOUT_MS=6000000 \\`,
   `CLAUDE_CODE_MAX_RETRIES=1000000 \\`,
   `NODE_TLS_REJECT_UNAUTHORIZED=0 \\`,
@@ -76,7 +81,7 @@ const claudeCodeCmd = (apiKey: string, model = 'GLM-5.1') => [
   `claude --dangerously-skip-permissions`,
 ].join('\n');
 
-const codexCmd = (apiKey: string, model = 'GLM-5.1') => [
+const codexCmd = (apiKey: string, model = 'JoyAI-Code-1.5') => [
   `OPENAI_BASE_URL=${getBaseURL()}/v1 \\`,
   `OPENAI_API_KEY="${apiKey}" \\`,
   `OPENAI_MODEL=${model} \\`,
@@ -165,19 +170,29 @@ const Accounts: React.FC = () => {
     useSensor(KeyboardSensor),
   );
 
-  const fetchAccounts = async () => {
-    setLoading(true);
+  const fetchAccounts = async (silent = false) => {
+    if (!silent) setLoading(true);
     try {
       const data = await api.listAccounts();
       setAccounts(data);
     } catch (e: unknown) {
-      message.error(e instanceof Error ? e.message : '获取账号列表失败');
+      if (silent) {
+        console.error(e);
+      } else {
+        message.error(e instanceof Error ? e.message : '获取账号列表失败');
+      }
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   };
 
-  useEffect(() => { fetchAccounts(); }, []);
+  // 切回页面时静默刷新账号列表，避免与数据概览的账号数不同步。
+  useEffect(() => {
+    fetchAccounts();
+    const onVisible = () => { if (document.visibilityState === 'visible') fetchAccounts(true); };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => document.removeEventListener('visibilitychange', onVisible);
+  }, []);
 
 
   const handleAdd = async (values: { pt_key: string; user_id: string; is_default?: boolean; default_model?: string }) => {
@@ -497,7 +512,7 @@ const Accounts: React.FC = () => {
       <div style={{ marginBottom: 16, display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 12 }}>
         <Typography.Title level={4} style={{ margin: 0 }}>账号管理</Typography.Title>
         <Space wrap>
-          <Button onClick={fetchAccounts} icon={<ReloadOutlined />}>刷新</Button>
+          <Button onClick={() => fetchAccounts()} icon={<ReloadOutlined />}>刷新</Button>
           <Button
             onClick={async () => {
               try {

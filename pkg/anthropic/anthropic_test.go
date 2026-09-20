@@ -2,6 +2,7 @@ package anthropic
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -9,6 +10,26 @@ import (
 
 	"github.com/vibe-coding-labs/JoyCode2Api/pkg/joycode"
 )
+
+func TestIsRetryableNonStreamError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "nil", err: nil, want: false},
+		{name: "HTTP 200 business error", err: fmt.Errorf("上游错误 : 模型服务调用失败"), want: false},
+		{name: "network error", err: fmt.Errorf("connection reset by peer"), want: true},
+		{name: "HTTP 503", err: fmt.Errorf("API error 503: unavailable"), want: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := isRetryableNonStreamError(tt.err); got != tt.want {
+				t.Fatalf("isRetryableNonStreamError(%v) = %v, want %v", tt.err, got, tt.want)
+			}
+		})
+	}
+}
 
 func TestResolveModel(t *testing.T) {
 	tests := []struct {
@@ -18,10 +39,10 @@ func TestResolveModel(t *testing.T) {
 		systemDefault  string
 		expected       string
 	}{
-		{"known joycode model passes through", "GLM-4.7", "", "", "GLM-4.7"},
+		{"known joycode model passes through", "GLM-5.3", "", "", "GLM-5.3"},
 		{"unknown model falls back to default", "claude-sonnet-4-20250514", "", "", joycode.DefaultModel},
-		{"account default overrides for unknown model", "claude-opus-4", "Kimi-K2.6", "GLM-5.1", "Kimi-K2.6"},
-		{"system default used when no account default", "unknown-model", "", "GLM-5.1", "GLM-5.1"},
+		{"account default overrides for unknown model", "claude-opus-4", "Kimi-K3", "GLM-5.3", "Kimi-K3"},
+		{"system default used when no account default", "unknown-model", "", "GLM-5.3", "GLM-5.3"},
 	}
 	for _, tt := range tests {
 		got := resolveModel(tt.model, tt.accountDefault, tt.systemDefault)

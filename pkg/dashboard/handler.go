@@ -20,12 +20,12 @@ import (
 	"sync"
 	"time"
 
-	_ "modernc.org/sqlite"
 	"github.com/vibe-coding-labs/JoyCode2Api/pkg/auth"
 	"github.com/vibe-coding-labs/JoyCode2Api/pkg/joycode"
 	"github.com/vibe-coding-labs/JoyCode2Api/pkg/keepalive"
 	"github.com/vibe-coding-labs/JoyCode2Api/pkg/proxy"
 	"github.com/vibe-coding-labs/JoyCode2Api/pkg/store"
+	_ "modernc.org/sqlite"
 )
 
 type Handler struct {
@@ -187,16 +187,16 @@ func (h *Handler) handleErrors(w http.ResponseWriter, r *http.Request) {
 // commonly hit without the /v1/ prefix. When these paths arrive at the
 // SPA catch-all we return a JSON 404 with a helpful hint instead of HTML.
 var knownAPISet = map[string]bool{
-	"/chat/completions":      true,
-	"/completions":           true,
-	"/messages":              true,
-	"/models":                true,
-	"/embeddings":            true,
-	"/web-search":            true,
-	"/rerank":                true,
-	"/images/generations":    true,
-	"/audio/transcriptions":  true,
-	"/audio/translations":    true,
+	"/chat/completions":     true,
+	"/completions":          true,
+	"/messages":             true,
+	"/models":               true,
+	"/embeddings":           true,
+	"/web-search":           true,
+	"/rerank":               true,
+	"/images/generations":   true,
+	"/audio/transcriptions": true,
+	"/audio/translations":   true,
 }
 
 // ServeStatic serves the SPA frontend for non-API routes.
@@ -525,13 +525,33 @@ func (h *Handler) listAccounts(w http.ResponseWriter, r *http.Request) {
 		statuses := h.keeper.GetAllStatuses()
 		for i := range accounts {
 			if s, ok := statuses[accounts[i].UserID]; ok {
-				if s.Valid { accounts[i].CredentialValid = 1 } else { accounts[i].CredentialValid = 0 }
+				databaseValid := accounts[i].CredentialValid
+				if s.Valid {
+					accounts[i].CredentialValid = 1
+				} else {
+					accounts[i].CredentialValid = 0
+				}
 				accounts[i].CredentialCheckedAt = s.LastChecked.Format("2006-01-02 15:04:05")
 				accounts[i].CredentialError = s.ErrorMessage
+				slog.Debug("accounts: keeper status overrides database status",
+					"user_id", accounts[i].UserID,
+					"database_valid", databaseValid,
+					"keeper_valid", s.Valid,
+					"keeper_checked_at", s.LastChecked,
+				)
 			}
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"accounts": accounts})
+}
+
+func (h *Handler) validateUpdatedCredential(userID, ptKey string) {
+	if h.keeper == nil {
+		return
+	}
+	if !h.keeper.CredentialUpdated(userID, ptKey, userID) {
+		slog.Warn("accounts: updated credential failed immediate validation", "user_id", userID)
+	}
 }
 
 func (h *Handler) addAccount(w http.ResponseWriter, r *http.Request) {
@@ -569,6 +589,7 @@ func (h *Handler) addAccount(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.validateUpdatedCredential(body.UserID, body.PtKey)
 	writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true, "user_id": body.UserID, "nickname": body.Nickname})
 }
 
@@ -642,12 +663,13 @@ func (h *Handler) handleAutoLogin(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if err := h.store.AddAccount(userID, creds.PtKey, nickname, isDefault, "GLM-5.1"); err != nil {
+	if err := h.store.AddAccount(userID, creds.PtKey, nickname, isDefault, joycode.DefaultModel); err != nil {
 		slog.Error("auto-login: save account failed", "user_id", userID, "error", err)
 		writeError(w, http.StatusInternalServerError, "保存账号失败: "+err.Error())
 		return
 	}
 
+	h.validateUpdatedCredential(userID, creds.PtKey)
 	slog.Info("auto-login: account saved", "user_id", userID, "nickname", nickname)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"ok":         true,
@@ -830,10 +852,11 @@ func (h *Handler) validateAndSavePtKey(ptKey string) (userID, nickname string, e
 		}
 	}
 
-	if saveErr := h.store.AddAccount(userID, ptKey, nickname, isDefault, "GLM-5.1"); saveErr != nil {
+	if saveErr := h.store.AddAccount(userID, ptKey, nickname, isDefault, joycode.DefaultModel); saveErr != nil {
 		return "", "", fmt.Errorf("save account failed: %w", saveErr)
 	}
 
+	h.validateUpdatedCredential(userID, ptKey)
 	slog.Info("oauth: account saved", "user_id", userID, "nickname", nickname)
 	return userID, nickname, nil
 }
@@ -997,7 +1020,7 @@ func (h *Handler) handleQRLoginStatus(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	if err := h.store.AddAccount(result.UserID, result.PtKey, nickname, isDefault, "GLM-5.1"); err != nil {
+	if err := h.store.AddAccount(result.UserID, result.PtKey, nickname, isDefault, joycode.DefaultModel); err != nil {
 		slog.Error("qr-login save account failed", "user_id", result.UserID, "error", err)
 		writeJSON(w, http.StatusOK, map[string]interface{}{
 			"status":  "confirmed",
@@ -1008,6 +1031,7 @@ func (h *Handler) handleQRLoginStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	h.validateUpdatedCredential(result.UserID, result.PtKey)
 	slog.Info("qr-login: account saved", "user_id", result.UserID, "nickname", nickname)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"status":    "confirmed",
@@ -1358,18 +1382,18 @@ func (h *Handler) handleStats(w http.ResponseWriter, r *http.Request) {
 	}
 
 	resp := map[string]interface{}{
-		"total_requests":       stats.TotalRequests,
-		"total_input_tokens":   stats.TotalInputTk,
-		"total_output_tokens":  stats.TotalOutputTk,
-		"accounts_count":       stats.AccountsCount,
-		"avg_latency_ms":       stats.AvgLatencyMs,
-		"error_count":          stats.ErrorCount,
-		"stream_count":         stats.StreamCount,
-		"success_count":        stats.SuccessCount,
-		"by_model":             stats.ByModel,
-		"by_account":           stats.ByAccount,
-		"all_time":             totals,
-		"hourly":               hourly,
+		"total_requests":      stats.TotalRequests,
+		"total_input_tokens":  stats.TotalInputTk,
+		"total_output_tokens": stats.TotalOutputTk,
+		"accounts_count":      stats.AccountsCount,
+		"avg_latency_ms":      stats.AvgLatencyMs,
+		"error_count":         stats.ErrorCount,
+		"stream_count":        stats.StreamCount,
+		"success_count":       stats.SuccessCount,
+		"by_model":            stats.ByModel,
+		"by_account":          stats.ByAccount,
+		"all_time":            totals,
+		"hourly":              hourly,
 	}
 	writeJSON(w, http.StatusOK, resp)
 }

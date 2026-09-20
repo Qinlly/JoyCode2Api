@@ -55,22 +55,17 @@ var colorEndpoints = map[string]colorEndpoint{
 	"/api/saas/anthropic/v1/messages":      {"anthropic_completions", "/api/saas/anthropic/v1/messages"},
 }
 
+// Models 与上游 ListModels 返回的最新可用模型列表保持同步（2026-08-31）。
+// 该表是 resolveModel 的白名单：不在表内的模型名会被静默回退,
+// 上游新增模型后需及时补充。
 var Models = []string{
 	"JoyAI-Code-1.5",
-	"JoyAI-Code",
-	"MiniMax-M3",
-	"MiniMax-M2.7",
-	"Kimi-K3",
-	"Kimi-K2.6",
-	"Kimi-K2.5",
 	"GLM-5.3",
-	"GLM-5.2",
 	"GLM-5.2-jcloud",
-	"GLM-5.1",
-	"GLM-5",
-	"GLM-5-jcloud",
-	"GLM-4.7",
+	"Kimi-K3",
+	"Kimi-K3-jcloud",
 	"DeepSeek-V4-Pro",
+	"MiniMax-M3",
 	"Doubao-Seed-2.0-pro",
 	"GPT-5.6 Sol",
 	"Claude-Opus-4.8",

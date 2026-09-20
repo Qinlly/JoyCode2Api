@@ -58,8 +58,8 @@ const Dashboard: React.FC = () => {
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [loading, setLoading] = useState(true);
 
-  const fetchData = async () => {
-    setLoading(true);
+  const fetchData = async (silent = false) => {
+    if (!silent) setLoading(true);
     try {
       const [statsData, accountsData] = await Promise.all([
         api.getStats(),
@@ -70,11 +70,24 @@ const Dashboard: React.FC = () => {
     } catch (e) {
       console.error(e);
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   };
 
-  useEffect(() => { fetchData(); }, []);
+  // 定时 + 切回页面时静默刷新：
+  // 1) 保证跨天后“今日”统计自动归零并重新累积（后台定时器可能被浏览器节流，
+  //    故同时监听 visibilitychange，回到标签页时立即拉一次）；
+  // 2) 保证“账号数”等指标与账号管理页的增删改动同步。
+  useEffect(() => {
+    fetchData();
+    const timer = setInterval(() => fetchData(true), 60_000);
+    const onVisible = () => { if (document.visibilityState === 'visible') fetchData(true); };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => {
+      clearInterval(timer);
+      document.removeEventListener('visibilitychange', onVisible);
+    };
+  }, []);
 
   if (loading) {
     return (

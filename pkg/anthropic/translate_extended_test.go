@@ -14,8 +14,8 @@ import (
 // ---------------------------------------------------------------------------
 
 func TestResolveModel_KnownJoyCodePassThrough(t *testing.T) {
-	// A known JoyCode model (e.g. "GLM-5.1") passes through directly.
-	input := "GLM-5.1"
+	// A known JoyCode model (e.g. "GLM-5.3") passes through directly.
+	input := "GLM-5.3"
 	got := resolveModel(input, "", "")
 	if got != input {
 		t.Errorf("resolveModel(%q) = %q, want %q (pass-through)", input, got, input)
